@@ -6,8 +6,16 @@ use std::io::{Write, BufWriter};
 use std::fs;
 use std::process::Stdio;
 use std::collections::HashMap;
+use std::cmp::min;
 use serde::{Deserialize, Serialize};
 use meval;
+use std::collections::VecDeque;
+
+const VOL_WINDOW: usize = 20;
+const EPS: f64 = 1e-9;
+const LAG_BUF: usize = 8;
+const N_FEATS: usize = 11;
+const K_BARS: usize = 4;
 
 #[derive(Deserialize, Debug)]
 struct Payload {
@@ -48,7 +56,7 @@ async fn fetch(
     let ticker = Ticker::new(&client, token);
 
     let mut history = ticker
-        .history(Some(Range::M1), Some(Interval::I15m), false)
+        .history(Some(Range::Y1), Some(Interval::I4h), false)
         .await?;
 
     if let Some(last) = history.last() {
@@ -59,16 +67,18 @@ async fn fetch(
 
     let mut x: Vec<Vec<f64>> = vec![];
     let mut y: Vec<f64> = vec![];
-    let mut prev: Option<Vec<f64>> = None;
     let mut first_ts: Option<i64> = None;
     let mut last_ts: i64 = 0;
 
+    let mut prev_close: Option<f64> = None;
+    let mut vol_buf:  VecDeque<f64> = VecDeque::with_capacity(VOL_WINDOW);
+    let mut feat_hist: VecDeque<Vec<f64>> = VecDeque::with_capacity(LAG_BUF);
+
+    let mut pending: VecDeque<(Vec<f64>, f64)> = VecDeque::with_capacity(K_BARS + 1);
+
     for candle in history {
         let ts = candle.ts;
-
-        if first_ts.is_none() {
-            first_ts = Some(ts.timestamp());
-        }
+        if first_ts.is_none() { first_ts = Some(ts.timestamp()); }
         last_ts = ts.timestamp();
 
         let open   = candle.ohlc.open .into_inner().as_f64();
@@ -79,24 +89,68 @@ async fn fetch(
             .map(|q| q.into_inner().into_inner().to_f64().unwrap_or(0.0))
             .unwrap_or(0.0);
 
-        let delta = close - open;
-        println!("{} : {}", ts, delta);
+        if let Some(pc) = prev_close {
+            let vol_mean = if vol_buf.is_empty() {
+                volume
+            } else {
+                vol_buf.iter().sum::<f64>() / vol_buf.len() as f64
+            };
 
-        if let Some(p) = prev.take() {
-            x.push(p);
-            y.push(delta);
+            let ret_open   = (close - open) / (open + EPS);
+            let ret_gap    = (open - pc) / (pc + EPS);
+            let range_rel  = (high - low) / (close + EPS);
+            let upper_wick = (high - f64::max(open, close)) / (close + EPS);
+            let lower_wick = (f64::min(open, close) - low) / (close + EPS);
+            let vol_ratio  = volume / (vol_mean + EPS);
+
+            let feats = vec![ret_open, ret_gap, range_rel, upper_wick, lower_wick, vol_ratio];
+
+            feat_hist.push_back(feats.clone());
+            if feat_hist.len() > LAG_BUF { feat_hist.pop_front(); }
+
+            let mut ext = feats.clone();
+            if feat_hist.len() >= 5 {
+                let k = feat_hist.len();
+                ext.push(feat_hist[k - 2][0]); // lag1_ret_open
+                ext.push(feat_hist[k - 3][0]); // lag2_ret_open
+                ext.push(feat_hist[k - 5][0]); // lag4_ret_open
+
+                let last5: Vec<f64> = feat_hist.iter().rev().take(5).map(|f| f[0]).collect();
+                let m = last5.iter().sum::<f64>() / last5.len() as f64;
+                let v = last5.iter().map(|z| (z - m).powi(2)).sum::<f64>() / last5.len() as f64;
+                ext.push(m);          // x10 — rolling mean ret_open
+                ext.push(v.sqrt());   // x11 — rolling std ret_open
+            } else {
+                ext.extend_from_slice(&[0.0, 0.0, 0.0, 0.0, 0.0]);
+            }
+
+            let sigma = ext[10].max(EPS);
+
+            pending.push_back((ext, close));
+
+            while pending.len() > K_BARS {
+                let (past_feats, close_now) = pending.pop_front().unwrap();
+                let target = (close - close_now) / (close_now * sigma);
+                x.push(past_feats);
+                y.push(target);
+            }
         }
-        prev = Some(vec![open, high, low, close, volume]);
+
+        if vol_buf.len() == VOL_WINDOW { vol_buf.pop_front(); }
+        vol_buf.push_back(volume);
+        prev_close = Some(close);
     }
 
-    if !x.is_empty() {
-        x.pop();
-        y.pop();
-    }
+    // last_ext — фичи последней свечи, для предсказания будущего
+    let last_ext = {
+        let mut v = vec![0.0; N_FEATS];
+        if let Some(f) = feat_hist.back() {
+            v[..6].copy_from_slice(f);
+        }
+        v
+    };
 
-    let last_ohlcv = prev.unwrap_or_else(|| vec![0.0; 5]);
-
-    Ok((x, y, last_ohlcv, first_ts.unwrap_or(0), last_ts))
+    Ok((x, y, last_ext, first_ts.unwrap_or(0), last_ts))
 }
 
 fn run(ts: &[Vec<f64>], target: &[f64], ref_price: f64, path: &str) -> std::io::Result<String> {
@@ -110,7 +164,6 @@ fn run(ts: &[Vec<f64>], target: &[f64], ref_price: f64, path: &str) -> std::io::
         .arg("src/model.jl")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .spawn()?;
 
     child.stdin.as_mut().unwrap()
@@ -138,7 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let range = "burmalda";
     let interval = "chemodan";
 
-    let (x, y, last_ohlcv, first_ts, last_ts) = fetch(token, range, interval)?;
+    let (x, y, last_features, first_ts, last_ts) = fetch(token, range, interval)?;
 
     let path = format!("checkpoints/{token}.json");
 
@@ -170,10 +223,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- диагностика ---
     let same_window = cfg.first_ts == first_ts && cfg.last_ts == last_ts;
     let same_data   = approx_eq(&y, &cfg.history, 1e-9);
-    eprintln!(
-        "[cache] model={:?}, len(y)={}, len(hist)={}, ts=({}, {}), same_window={}, same_data={}",
-        cfg.model, y.len(), cfg.history.len(), first_ts, last_ts, same_window, same_data,
-    );
     if !same_window {
         eprintln!(
             "  window changed: first_ts {} -> {}, last_ts {} -> {}",
@@ -182,7 +231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // --- /диагностика ---
 
-    let cache_valid = cfg.model != "x1" && same_window;
+    let cache_valid = cfg.model != "x1" && same_window && same_data;
 
     let payload: Payload = if cache_valid {
         Payload {
@@ -191,28 +240,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             metrics: cfg.metrics.clone(),
         }
     } else {
-        let ref_price = last_ohlcv[3];
         let julia_exe = env::var("JULIA_PATH").unwrap_or_else(|_| "julia".to_string());
-        let out = run(&x, &y, ref_price, &julia_exe)?;
+        let out = run(&x, &y, 1.0, &julia_exe)?;
         serde_json::from_str(&out).expect("cannot deserialize Julia output")
     };
+
+    eprintln!(
+        "[cache] model={:?}, len(y)={}, len(hist)={}, ts=({}, {}), same_window={}, same_data={}",
+        payload.equation, y.len(), cfg.history.len(), first_ts, last_ts, same_window, same_data,
+    );
 
     if let Some(m) = &payload.metrics {
         eprintln!("[backtest] sharpe={:.3} sortino={:.3} mdd={:.3} turnover={:.0} ret={:.3}",
             m.sharpe, m.sortino, m.max_drawdown, m.turnover, m.total_return);
     }
 
-    let mut map = HashMap::new();
-    map.insert("x1", last_ohlcv[0]); // open
-    map.insert("x2", last_ohlcv[1]); // high
-    map.insert("x3", last_ohlcv[2]); // low
-    map.insert("x4", last_ohlcv[3]); // close
-    map.insert("x5", last_ohlcv[4]); // volume
-
     let mut mctx = meval::Context::new();
-    for (key, value) in &map {
-        mctx.var(*key, *value);
-    }
+    for (i, v) in last_features.iter().enumerate() {
+        mctx.var(format!("x{}", i + 1), *v);
+}
 
     mctx.func("inv_op",    |x| 1.0 / x);
 
@@ -226,7 +272,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match meval::eval_str_with_context(&payload.equation, &mctx) {
         Ok(func_result) => {
             println!(
-                "predicted delta for next candle (n={}): {}",
+                "predicted return for next candle (n={}): {}",
                 payload.n, func_result
             );
         }
