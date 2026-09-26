@@ -1095,6 +1095,7 @@ name = "quant"
 version = "0.1.0"
 dependencies = [
  "meval",
+ "num-traits",
  "serde",
  "serde_json",
  "tokio",
