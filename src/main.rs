@@ -1,30 +1,34 @@
-use std::{process::Command, vec};
-use std::env;
-use num_traits::cast::ToPrimitive;
-use yfinance_rs::{Decimal, Interval, Range, Ticker, YfClient};
-use std::io::{Write, BufWriter};
-use std::fs;
-use std::process::Stdio;
-use std::collections::HashMap;
-use std::cmp::min;
-use serde::{Deserialize, Serialize};
+use chrono::{Duration, Utc};
+use log::{debug, error, info, warn};
 use meval;
-use std::collections::VecDeque;
+use num_traits::cast::ToPrimitive;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::VecDeque,
+    env, fs,
+    io::{BufWriter, Write},
+    process::{Command, Stdio},
+};
+use yfinance_rs::{Interval, Range, Ticker, YfClient};
 
 const VOL_WINDOW: usize = 20;
-const EPS: f64 = 1e-9;
-const LAG_BUF: usize = 8;
+const FEATURE_WINDOW: usize = 5;
 const N_FEATS: usize = 11;
 const K_BARS: usize = 1;
+const MIN_SIGMA: f64 = 1e-8;
+
+const MODEL_VERSION: &str = "2026-09-27/features-v2/close-close-scaled-v2/cost-return-v2/wf-v2";
 
 #[derive(Deserialize, Debug)]
 struct Payload {
-    equation: String,
-    n: i64,
+    status: String,
+    equation: Option<String>,
+    n: usize,
     #[serde(default)]
     metrics: Option<Metrics>,
+    #[serde(default)]
+    reason: Option<String>,
 }
-
 #[derive(Deserialize, Debug, Serialize, Clone)]
 struct Metrics {
     sharpe: f64,
@@ -33,309 +37,374 @@ struct Metrics {
     turnover: f64,
     total_return: f64,
 }
-
 #[derive(Debug, Deserialize, Serialize)]
 struct Checkpoint {
+    model_version: String,
     history: Vec<f64>,
-    model: String,
+    status: String,
+    equation: Option<String>,
     #[serde(default)]
+    rejection_reason: Option<String>,
     first_ts: i64,
-    #[serde(default)]
     last_ts: i64,
+    sample_count: usize,
     #[serde(default)]
     metrics: Option<Metrics>,
 }
+#[derive(Clone, Debug)]
+struct Bar {
+    ts: i64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+}
+#[derive(Debug)]
+struct Dataset {
+    x: Vec<Vec<f64>>,
+    target_scaled_return: Vec<f64>,
+    target_scales: Vec<f64>,
+    last_features: Vec<f64>,
+    first_ts: i64,
+    last_ts: i64,
+}
+fn finite_positive(v: f64) -> bool {
+    v.is_finite() && v > MIN_SIGMA
+}
+fn all_finite(v: &[f64]) -> bool {
+    v.iter().all(|x| x.is_finite())
+}
 
-#[tokio::main]
-async fn fetch(
-    token: &str,
-    _range: &str,
-    _interval: &str,
-) -> Result<(Vec<Vec<f64>>, Vec<f64>, Vec<f64>, i64, i64), Box<dyn std::error::Error>> {
-    let client = YfClient::default();
-    let ticker = Ticker::new(&client, token);
+fn build_dataset(bars: &[Bar]) -> Dataset {
+    let mut x = vec![];
+    let mut target_scaled_return = vec![];
+    let mut target_scales = vec![];
+    let mut prev_close = None;
+    let mut volume_history = VecDeque::with_capacity(VOL_WINDOW);
+    let mut feature_history = VecDeque::with_capacity(FEATURE_WINDOW);
 
-    let mut history = ticker
-        .history(Some(Range::Y2), Some(Interval::I1h), false)
-        .await?;
-
-    if let Some(last) = history.last() {
-        if last.ohlc.close.clone().into_inner() == last.ohlc.open.clone().into_inner() {
-            history.pop();
+    let mut pending: Option<(Vec<f64>, f64, f64)> = None;
+    let mut last_features = vec![0.0; N_FEATS];
+    let (mut first_ts, mut last_ts) = (0, 0);
+    for bar in bars {
+        if ![bar.open, bar.high, bar.low, bar.close, bar.volume]
+            .iter()
+            .all(|v| v.is_finite())
+            || !finite_positive(bar.open)
+            || !finite_positive(bar.close)
+            || bar.volume < 0.0
+        {
+            continue;
         }
-    }
-
-    let mut x: Vec<Vec<f64>> = vec![];
-    let mut y: Vec<f64> = vec![];
-    let mut first_ts: Option<i64> = None;
-    let mut last_ts: i64 = 0;
-
-    let mut prev_close: Option<f64> = None;
-    let mut vol_buf:  VecDeque<f64> = VecDeque::with_capacity(VOL_WINDOW);
-    let mut feat_hist: VecDeque<Vec<f64>> = VecDeque::with_capacity(LAG_BUF);
-
-    let mut pending: VecDeque<(Vec<f64>, f64)> = VecDeque::with_capacity(K_BARS + 1);
-    let mut bars_since_sample: usize = 0;
-
-    for candle in history {
-        let ts = candle.ts;
-        if first_ts.is_none() { first_ts = Some(ts.timestamp()); }
-        last_ts = ts.timestamp();
-
-        let open   = candle.ohlc.open .into_inner().as_f64();
-        let high   = candle.ohlc.high .into_inner().as_f64();
-        let low    = candle.ohlc.low  .into_inner().as_f64();
-        let close  = candle.ohlc.close.into_inner().as_f64();
-        let volume = candle.volume
-            .map(|q| q.into_inner().into_inner().to_f64().unwrap_or(0.0))
-            .unwrap_or(0.0);
-
+        if first_ts == 0 {
+            first_ts = bar.ts
+        };
+        last_ts = bar.ts;
         if let Some(pc) = prev_close {
-            let vol_mean = if vol_buf.is_empty() {
-                volume
-            } else {
-                vol_buf.iter().sum::<f64>() / vol_buf.len() as f64
-            };
-
-            let ret_open   = (close - open) / (open + EPS);
-            let ret_gap    = (open - pc) / (pc + EPS);
-            let range_rel  = (high - low) / (close + EPS);
-            let upper_wick = (high - f64::max(open, close)) / (close + EPS);
-            let lower_wick = (f64::min(open, close) - low) / (close + EPS);
-            let vol_ratio  = volume / (vol_mean + EPS);
-
-            let feats = vec![ret_open, ret_gap, range_rel, upper_wick, lower_wick, vol_ratio];
-
-            feat_hist.push_back(feats.clone());
-            if feat_hist.len() > LAG_BUF { feat_hist.pop_front(); }
-
-            let mut ext = feats.clone();
-            if feat_hist.len() >= 5 {
-                let k = feat_hist.len();
-                ext.push(feat_hist[k - 2][0]); // lag1_ret_open
-                ext.push(feat_hist[k - 3][0]); // lag2_ret_open
-                ext.push(feat_hist[k - 5][0]); // lag4_ret_open
-
-                let last5: Vec<f64> = feat_hist.iter().rev().take(5).map(|f| f[0]).collect();
-                let m = last5.iter().sum::<f64>() / last5.len() as f64;
-                let v = last5.iter().map(|z| (z - m).powi(2)).sum::<f64>() / last5.len() as f64;
-                ext.push(m);          // x10 — rolling mean ret_open
-                ext.push(v.sqrt());   // x11 — rolling std ret_open
-            } else {
-                ext.extend_from_slice(&[0.0, 0.0, 0.0, 0.0, 0.0]);
-            }
-
-            let sigma = ext[10].max(EPS);
-
-            pending.push_back((ext, close));
-            bars_since_sample += 1;
-
-            if pending.len() > K_BARS {
-                let (past_feats, close_now) = pending.pop_front().unwrap();
-
-                if bars_since_sample >= K_BARS {
-                    bars_since_sample = 0;
-                    let target = (close - close_now) / (close_now * sigma);
-                    x.push(past_feats);
-                    y.push(target);
+            if finite_positive(pc) {
+                let vm = if volume_history.is_empty() {
+                    bar.volume
+                } else {
+                    volume_history.iter().sum::<f64>() / volume_history.len() as f64
+                };
+                if finite_positive(vm) {
+                    let base = vec![
+                        (bar.close - bar.open) / bar.open,
+                        (bar.open - pc) / pc,
+                        (bar.high - bar.low) / bar.close,
+                        (bar.high - bar.open.max(bar.close)) / bar.close,
+                        (bar.open.min(bar.close) - bar.low) / bar.close,
+                        bar.volume / vm,
+                    ];
+                    if all_finite(&base) {
+                        feature_history.push_back(base.clone());
+                        if feature_history.len() > FEATURE_WINDOW {
+                            feature_history.pop_front();
+                        }
+                        if feature_history.len() == FEATURE_WINDOW {
+                            let r: Vec<f64> = feature_history.iter().map(|f| f[0]).collect();
+                            let mean = r.iter().sum::<f64>() / FEATURE_WINDOW as f64;
+                            let sigma = (r.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                                / FEATURE_WINDOW as f64)
+                                .sqrt();
+                            let k = feature_history.len();
+                            let mut features = base;
+                            features.extend_from_slice(&[
+                                feature_history[k - 2][0],
+                                feature_history[k - 3][0],
+                                feature_history[k - 5][0],
+                                mean,
+                                sigma,
+                            ]);
+                            if all_finite(&features) && sigma >= MIN_SIGMA {
+                                if let Some((past_features, past_close, past_sigma)) =
+                                    pending.take()
+                                {
+                                    let target_return = (bar.close - past_close) / past_close;
+                                    let scaled = target_return / past_sigma;
+                                    if target_return.is_finite() && scaled.is_finite() {
+                                        x.push(past_features);
+                                        target_scaled_return.push(scaled);
+                                        target_scales.push(past_sigma);
+                                    }
+                                }
+                                last_features = features.clone();
+                                pending = Some((features, bar.close, sigma));
+                            }
+                        }
+                    }
                 }
             }
         }
-
-        if vol_buf.len() == VOL_WINDOW { vol_buf.pop_front(); }
-        vol_buf.push_back(volume);
-        prev_close = Some(close);
+        if volume_history.len() == VOL_WINDOW {
+            volume_history.pop_front();
+        }
+        volume_history.push_back(bar.volume);
+        prev_close = Some(bar.close);
     }
-
-    // last_ext — фичи последней свечи, для предсказания будущего
-    let last_ext = {
-        let mut v = vec![0.0; N_FEATS];
-        if let Some(f) = feat_hist.back() {
-            v[..6].copy_from_slice(f);
-        }
-        let k = feat_hist.len();
-        if k >= 5 {
-            v[6] = feat_hist[k - 2][0]; // x7  lag1 ret_open
-            v[7] = feat_hist[k - 3][0]; // x8  lag2 ret_open
-            v[8] = feat_hist[k - 5][0]; // x9  lag4 ret_open
-
-            let last5: Vec<f64> =
-                feat_hist.iter().rev().take(5).map(|f| f[0]).collect();
-            let m = last5.iter().sum::<f64>() / last5.len() as f64;
-            let var = last5.iter().map(|z| (z - m).powi(2)).sum::<f64>()
-                    / last5.len() as f64;
-            v[9]  = m;          // x10
-            v[10] = var.sqrt(); // x11
-        }
-        v
-    };
-
-    Ok((x, y, last_ext, first_ts.unwrap_or(0), last_ts))
+    debug_assert!(x.iter().all(|row| row.len() == N_FEATS && all_finite(row)));
+    debug_assert!(target_scaled_return.iter().all(|v| v.is_finite()));
+    Dataset {
+        x,
+        target_scaled_return,
+        target_scales,
+        last_features,
+        first_ts,
+        last_ts,
+    }
 }
 
-fn run(ts: &[Vec<f64>], target: &[f64], ref_price: f64, path: &str) -> std::io::Result<String> {
-    let payload = serde_json::json!({
-        "ts":        ts,
-        "target":    target,
-        "ref_price": ref_price,
-        "k_bars":    K_BARS,
-    });
+#[tokio::main]
+async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
+    info!("Fetching data for {}", token);
+    let client = YfClient::default();
+    let ticker = Ticker::new(&client, token);
+    let history = ticker
+        .history(Some(Range::Y2), Some(Interval::I1h), false)
+        .await?;
+    let now = Utc::now();
 
+    let bars = history
+        .into_iter()
+        .filter_map(|c| {
+            if c.ts + Duration::hours(1) > now {
+                return None;
+            };
+            Some(Bar {
+                ts: c.ts.timestamp(),
+                open: c.ohlc.open.into_inner().as_f64(),
+                high: c.ohlc.high.into_inner().as_f64(),
+                low: c.ohlc.low.into_inner().as_f64(),
+                close: c.ohlc.close.into_inner().as_f64(),
+                volume: c
+                    .volume
+                    .map(|q| q.into_inner().into_inner().to_f64().unwrap_or(f64::NAN))
+                    .unwrap_or(f64::NAN),
+            })
+        })
+        .collect::<Vec<_>>();
+    debug!("Fetched {} bars for {}", bars.len(), token);
+    let dataset = build_dataset(&bars);
+    debug!("Built dataset with {} samples for {}", dataset.x.len(), token);
+    Ok(dataset)
+}
+
+fn run(x: &[Vec<f64>], y: &[f64], scales: &[f64], path: &str) -> std::io::Result<String> {
+    info!("Running Julia model with {} samples", x.len());
+    let body = serde_json::json!({"features":x,"target_scaled_return":y,"target_scales":scales,"k_bars":K_BARS});
+    debug!("Julia input: features={}, targets={}, scales={}", x.len(), y.len(), scales.len());
     let mut child = Command::new(path)
         .arg("src/model.jl")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()?;
-
-    child.stdin.as_mut().unwrap()
-        .write_all(payload.to_string().as_bytes())?;
-
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(body.to_string().as_bytes())?;
     drop(child.stdin.take());
-
     let out = child.wait_with_output()?;
     if !out.status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Julia failed: {}", String::from_utf8_lossy(&out.stderr)),
-        ));
+        error!("Julia process failed with status: {:?}", out.status);
+        return Err(std::io::Error::other("Julia failed"));
     }
+    debug!("Julia output length: {} bytes", out.stdout.len());
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
-
-fn approx_eq(a: &[f64], b: &[f64], eps: f64) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(u, v)| (u - v).abs() <= eps)
+fn approx_eq(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(u, v)| (u - v).abs() <= 1e-9)
 }
-
+fn checkpoint_is_valid(c: &Checkpoint, data: &Dataset) -> bool {
+    c.model_version == MODEL_VERSION
+        && c.status == "accepted"
+        && c.equation.is_some()
+        && c.first_ts == data.first_ts
+        && c.last_ts == data.last_ts
+        && approx_eq(&c.history, &data.target_scaled_return)
+}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args: Vec<String> = env::args().collect();
-    // let token = &args[1];
-    let range = "burmalda";
-    let interval = "chemodan";
-
-    args.drain(0..1);
-    for arg in args {
-    let token = &arg;
-    eprintln!("{} START", token);
-
-    let (x, y, last_features, first_ts, last_ts) = fetch(token, range, interval)?;
-
-    let path = format!("checkpoints/{token}.json");
-
-    let mut cfg: Checkpoint = match fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).expect("can't deserialize checkpoint for token"),
-
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all("checkpoints")?;
-
-            let cfg = Checkpoint {
-                history: y.clone(),
-                model: "x1".to_string(),
-                first_ts,
-                last_ts,
-                metrics: None,
-            };
-
-            let file = fs::File::create(&path)?;
-            let mut w = BufWriter::new(file);
-            serde_json::to_writer_pretty(&mut w, &cfg)?;
-            w.flush()?;
-
-            cfg
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("debug")
+    ).init();
+    info!("Starting pipeline");
+    for token in env::args().skip(1) {
+        info!("Processing token: {}", token);
+        let data = fetch(&token)?;
+        if data.x.len() < 50 {
+            warn!(
+                "{}: insufficient valid completed hourly history ({} samples)",
+                token, data.x.len()
+            );
+            continue;
         }
-
-        Err(e) => return Err(e.into()),
-    };
-
-    // --- диагностика ---
-    let same_window = cfg.first_ts == first_ts && cfg.last_ts == last_ts;
-    let same_data   = approx_eq(&y, &cfg.history, 1e-9);
-    if !same_window {
-        eprintln!(
-            "  window changed: first_ts {} -> {}, last_ts {} -> {}",
-            cfg.first_ts, first_ts, cfg.last_ts, last_ts
+        fs::create_dir_all("checkpoints")?;
+        let path = format!("checkpoints/{token}.json");
+        let old: Option<Checkpoint> = fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+        let cache_valid = old.as_ref().is_some_and(|c| checkpoint_is_valid(c, &data));
+        
+        if cache_valid {
+            info!("Using cached checkpoint for {}", token);
+        } else {
+            info!("Cache invalid or missing, running Julia model for {}", token);
+        }
+        
+        let payload = if cache_valid {
+            let c = old.as_ref().unwrap();
+            debug!("Loading cached model: status={}, equation={:?}", c.status, c.equation);
+            Payload {
+                status: c.status.clone(),
+                equation: c.equation.clone(),
+                n: c.sample_count,
+                metrics: c.metrics.clone(),
+                reason: None,
+            }
+        } else {
+            let julia = env::var("JULIA_PATH").unwrap_or_else(|_| "julia".into());
+            debug!("Julia path: {}", julia);
+            serde_json::from_str(&run(
+                &data.x,
+                &data.target_scaled_return,
+                &data.target_scales,
+                &julia,
+            )?)?
+        };
+        info!(
+            "Model result: token={} status={} samples={} reason={:?}",
+            token, payload.status, payload.n, payload.reason
         );
-    }
-    // --- /диагностика ---
-
-    let metrics_ok  = cfg.metrics.as_ref().map_or(false, |m| m.sharpe > 0.5);
-    let cache_valid = cfg.model != "x1" && same_window && same_data && metrics_ok;
-
-    let payload: Payload = if cache_valid {
-        Payload {
-            equation: cfg.model.clone(),
-            n: y.len() as i64,
-            metrics: cfg.metrics.clone(),
+        let checkpoint = Checkpoint {
+            model_version: MODEL_VERSION.into(),
+            history: data.target_scaled_return.clone(),
+            status: payload.status.clone(),
+            equation: payload.equation.clone(),
+            rejection_reason: payload.reason.clone(),
+            first_ts: data.first_ts,
+            last_ts: data.last_ts,
+            sample_count: data.x.len(),
+            metrics: payload.metrics.clone(),
+        };
+        debug!("Saving checkpoint to {}", path);
+        let mut out = BufWriter::new(fs::File::create(&path)?);
+        serde_json::to_writer_pretty(&mut out, &checkpoint)?;
+        out.flush()?;
+        if payload.status != "accepted" {
+            warn!("Model rejected, skipping prediction");
+            continue;
         }
-    } else {
-        let julia_exe = env::var("JULIA_PATH").unwrap_or_else(|_| "julia".to_string());
-        let out = run(&x, &y, 1.0, &julia_exe)?;
-        serde_json::from_str(&out).expect("cannot deserialize Julia output")
-    };
-
-    eprintln!(
-        "[cache] model={:?}, len(y)={}, len(hist)={}, ts=({}, {}), same_window={}, same_data={}",
-        payload.equation, y.len(), cfg.history.len(), first_ts, last_ts, same_window, same_data,
-    );
-
-    if let Some(m) = &payload.metrics {
-        eprintln!("[backtest] sharpe={:.3} sortino={:.3} mdd={:.3} turnover={:.0} ret={:.3}",
-            m.sharpe, m.sortino, m.max_drawdown, m.turnover, m.total_return);
+        let equation = payload
+            .equation
+            .as_deref()
+            .ok_or("accepted model without equation")?;
+        debug!("Evaluating equation: {}", equation);
+        let mut ctx = meval::Context::new();
+        for (i, v) in data.last_features.iter().enumerate() {
+            ctx.var(format!("x{}", i + 1), *v);
+        }
+        ctx.func2("safe_div", |a, b| a / (b.abs() + 1e-4));
+        ctx.func("safe_sqrt", |a| a.abs().sqrt());
+        ctx.func("safe_log", |a| (a.abs() + 1e-9).ln());
+        match meval::eval_str_with_context(equation, &ctx) {
+            Ok(p) if p.is_finite() => {
+                info!("Prediction for {}: {}", token, p);
+                println!("predicted scaled close-to-close return for next candle of {token}: {p}")
+            }
+            Ok(_) => warn!("Non-finite equation result for {}", token),
+            Err(e) => error!("Evaluation error for {}: {}", token, e),
+        }
     }
-
-    let mut mctx = meval::Context::new();
-    for (i, v) in last_features.iter().enumerate() {
-        mctx.var(format!("x{}", i + 1), *v);
+    info!("Pipeline complete");
+    Ok(())
 }
 
-    mctx.func("inv_op",    |x| 1.0 / x);
-
-    mctx.func2("safe_div", |a: f64, b: f64| a / (b.abs() + 1e-4));
-    mctx.func("safe_sqrt", |x| x.abs().sqrt());
-    mctx.func("safe_log",  |x| (x.abs() + 1e-9).ln());
-    mctx.func("safe_inv",  |x| {
-        let eps = if x >= 0.0 { 1e-9 } else { -1e-9 };
-        1.0 / (x + eps)
-    });
-
-    match meval::eval_str_with_context(&payload.equation, &mctx) {
-        Ok(func_result) if payload.n > 0 => {
-            println!(
-                "predicted return for next candle of {} (n={}): {}",
-                token, payload.n, func_result
-            );
-
-            let mean_y = y.iter().sum::<f64>() / y.len() as f64;
-            let std_y  = (y.iter().map(|z| (z - mean_y).powi(2)).sum::<f64>()
-                          / y.len() as f64).sqrt();
-            let z       = (func_result - mean_y) / std_y;
-            let capped_z = z.clamp(-3.0, 3.0);
-            let capped   = mean_y + capped_z * std_y;
-            eprintln!("[pred] raw={:.3} capped={:.3}", func_result, capped);
-        }
-        Ok(_) => {
-            eprintln!("[pred] skipped: no deployed model for {} (n=0)", token);
-        }
-        Err(e) => {
-            eprintln!("calculation error: {}", e);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn bars() -> Vec<Bar> {
+        (0..16)
+            .map(|i| {
+                let o = 100.0 + i as f64;
+                Bar {
+                    ts: (i + 1) * 3600,
+                    open: o,
+                    high: o + 2.0,
+                    low: o - 1.0,
+                    close: o + 1.0 + (i % 2) as f64,
+                    volume: 1000.0 + i as f64,
+                }
+            })
+            .collect()
     }
-
-    if payload.n > 0 {
-        cfg.history  = y;
-        cfg.model    = payload.equation;
-        cfg.first_ts = first_ts;
-        cfg.last_ts  = last_ts;
-        cfg.metrics  = payload.metrics;
-        let file = fs::File::create(&path)?;
-        let mut w = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut w, &cfg)?;
-        w.flush()?;
-    } else {
-        eprintln!("[cache] placeholder (n=0), checkpoint preserved");
+    #[test]
+    fn features_targets_finite_lagged() {
+        let d = build_dataset(&bars());
+        assert!(!d.x.is_empty());
+        assert!(d.x.iter().all(|r| r.len() == N_FEATS && all_finite(r)));
+        assert_eq!(d.x.len(), d.target_scales.len());
     }
-
-    eprintln!("{} END", token);
-
+    #[test]
+    fn pending_sigma_normalizes_following_return() {
+        let d = build_dataset(&bars());
+        let b = bars();
+        let raw = (b[6].close - b[5].close) / b[5].close;
+        assert!((d.target_scaled_return[0] * d.target_scales[0] - raw).abs() < 1e-12);
     }
-    Ok(())
+    #[test]
+    fn invalid_data_rejected() {
+        let mut b = bars();
+        b[6].close = f64::NAN;
+        let d = build_dataset(&b);
+        assert!(d.x.iter().flatten().all(|v| v.is_finite()));
+    }
+    #[test]
+    fn version_invalidates_checkpoint() {
+        let data = build_dataset(&bars());
+        let old = Checkpoint {
+            model_version: "old".into(),
+            history: data.target_scaled_return.clone(),
+            status: "accepted".into(),
+            equation: Some("x1".into()),
+            rejection_reason: None,
+            first_ts: data.first_ts,
+            last_ts: data.last_ts,
+            sample_count: data.x.len(),
+            metrics: None,
+        };
+        assert!(!checkpoint_is_valid(&old, &data));
+    }
+    #[test]
+    fn rejected_models_have_no_equation() {
+        let p = Payload {
+            status: "rejected".into(),
+            equation: None,
+            n: 0,
+            metrics: None,
+            reason: None,
+        };
+        assert!(p.status != "accepted" && p.equation.is_none());
+    }
 }

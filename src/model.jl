@@ -4,330 +4,336 @@ using JSON3
 using Statistics
 using Random
 using SymbolicRegression: eval_tree_array
-using Logging
 using LoopVectorization
-Logging.disable_logging(Logging.Warn)
+using Logging
 
-safe_log(x)  = log(abs(x) + 1e-9)
+const logger = ConsoleLogger(stderr)
+global_logger(logger)
+# Logging.disable_logging(Logging.Warn)
+
+const PERIODS_PER_YEAR = 252 * 7
+
+const COST_RATE = 0.0005
+const MIN_TRAIN_SAMPLES = 40
+
+const GATE_MEDIAN_SHARPE = 0.5
+const GATE_POSITIVE_FOLDS = 0.6
+const GATE_T_STAT = 0.8
+const GATE_MIN_SHARPE = -1.0
+const GATE_BEATS_SHUFFLE = 0.6
+const GATE_BEATS_BUY_HOLD = 0.5
+
+# @turbo warn_check_args=false
+
+safe_log(x) = log(abs(x) + 1e-9)
 safe_sqrt(x) = sqrt(abs(x))
 safe_div(a, b) = a / (abs(b) + 1e-4)
+finite_or_zero(x) = isfinite(x) ? Float64(x) : 0.0
 
-_finite(x) = isfinite(x) ? Float64(x) : 0.0
+function empty_metrics()
+    return (
+        sharpe = 0.0,
+        sortino = 0.0,
+        max_drawdown = 0.0,
+        turnover = 0.0,
+        total_return = 0.0,
+        t_stat = 0.0,
+        std_pred = 0.0,
+        bh_sharpe = 0.0,
+    )
+end
 
-function to_matrix(xs)
-    n = length(xs)
-    m = length(xs[1])
-    X = Matrix{Float64}(undef, n, m)
-    @inbounds for i in 1:n
-        row = xs[i]
-        for j in 1:m
-            X[i, j] = Float64(row[j])
+function rows_to_matrix(rows)
+    isempty(rows) && return zeros(0, 0)
+
+    X = Matrix{Float64}(undef, length(rows), length(rows[1]))
+    for row_index in eachindex(rows)
+        for feature_index in eachindex(rows[row_index])
+            X[row_index, feature_index] = Float64(rows[row_index][feature_index])
         end
     end
     return X
 end
 
-function sharpe_ratio(pnl; periods_per_year=1512)
-    length(pnl) < 2 && return 0.0
-    μ = mean(pnl); σ = std(pnl)
-    return σ == 0 ? 0.0 : (μ / σ) * sqrt(periods_per_year)
+function sharpe_ratio(returns; periods_per_year = PERIODS_PER_YEAR)
+    length(returns) < 2 && return 0.0
+
+    return_std = std(returns)
+    (!isfinite(return_std) || return_std <= 1e-12) && return 0.0
+
+    return finite_or_zero(mean(returns) / return_std * sqrt(periods_per_year))
 end
 
-function sortino_ratio(pnl; periods_per_year=1512)
-    length(pnl) < 2 && return 0.0
-    μ = mean(pnl)
-    downside = pnl[pnl .< 0]
-    isempty(downside) && return 0.0
-    σ_d = std(downside)
-    return σ_d == 0 ? 0.0 : (μ / σ_d) * sqrt(periods_per_year)
+function sortino_ratio(returns; periods_per_year = PERIODS_PER_YEAR)
+    downside_returns = returns[returns .< 0]
+    length(downside_returns) < 2 && return 0.0
+
+    downside_std = std(downside_returns)
+    downside_std <= 1e-12 && return 0.0
+
+    return finite_or_zero(mean(returns) / downside_std * sqrt(periods_per_year))
 end
 
-function max_drawdown_dollars(pnl)
-    equity = cumsum(pnl)
-    peak   = accumulate(max, equity)
-    return minimum(equity .- peak)
-end
 
-function backtest_metrics(y_true, y_pred;
-                          cost_bps = 5.0, ref_price = 1.0,
-                          periods_per_year = 1512)
-    n = length(y_true)
-    if n < 2
-        return (sharpe=0.0, sortino=0.0, max_drawdown=0.0,
-                turnover=0.0, total_return=0.0, t_stat=0.0,
-                std_pred=0.0, bh_sharpe=0.0)
-    end
+function backtest_metrics(y_scaled, prediction_scaled, scales; cost_rate = COST_RATE)
+    n = length(y_scaled)
+    valid_input = n >= 2 &&
+                  length(prediction_scaled) == n &&
+                  length(scales) == n &&
+                  all(isfinite, y_scaled) &&
+                  all(isfinite, prediction_scaled) &&
+                  all(scale -> isfinite(scale) && scale > 0, scales)
+    !valid_input && return empty_metrics()
 
-    μ_pred = mean(y_pred)
-    σ_pred = std(y_pred)
+    raw_returns = y_scaled .* scales
+    raw_predictions = prediction_scaled .* scales
 
-    if σ_pred < 1e-12
-        pos = zeros(n)
+    prediction_std = std(raw_predictions)
+    positions = if prediction_std <= 1e-12
+        zeros(n)
     else
-        z   = (y_pred .- μ_pred) ./ σ_pred
-        pos = tanh.(z)
+        prediction_zscore = (raw_predictions .- mean(raw_predictions)) ./ prediction_std
+        tanh.(prediction_zscore)
     end
 
-    pnl     = pos .* y_true
-    trade   = abs.(diff(pos))
-    cost    = [0.0; cost_bps * 1e-4 * ref_price .* trade]
-    pnl_net = pnl .- cost
+    gross_returns = positions .* raw_returns
+    traded_notional = abs.([positions[1]; diff(positions)])
+    transaction_costs = cost_rate .* traded_notional
+    net_returns = gross_returns .- transaction_costs
 
-    sharpe  = sharpe_ratio(pnl_net;  periods_per_year=periods_per_year)
-    sortino = sortino_ratio(pnl_net; periods_per_year=periods_per_year)
-    mdd     = max_drawdown_dollars(pnl_net)
-    turn    = sum(trade)
-    total   = sum(pnl_net)
-    t_stat  = std(pnl_net) == 0 ? 0.0 :
-              mean(pnl_net) / std(pnl_net) * sqrt(n)
-
-    bh_sharpe = sharpe_ratio(y_true; periods_per_year=periods_per_year)
-
-    return (sharpe=sharpe, sortino=sortino, max_drawdown=mdd,
-            turnover=turn, total_return=total,
-            t_stat=t_stat, std_pred=σ_pred, bh_sharpe=bh_sharpe)
-end
-
-function trading_loss(tree, dataset, options)
-    y_pred, completed = eval_tree_array(tree, dataset.X, options)
-    (!completed || !all(isfinite, y_pred)) && return Inf
-
-    y_true = dataset.y
-
-    if length(y_true) >= 10
-        lo, hi = quantile(y_true, [0.01, 0.99])
-        y_pred = clamp.(y_pred, lo * 5, hi * 5)
-    end
-
-    μ_pred = mean(y_pred)
-    σ_pred = std(y_pred) + 1e-9
-    z      = (y_pred .- μ_pred) ./ σ_pred
-    pos    = tanh.(z)
-    pnl    = pos .* y_true
-
-    μ = mean(pnl); σ = std(pnl) + 1e-9
-    return -μ / σ * sqrt(length(pnl))
-end
-
-function _make_model(y_tr; budget, parsimony_mult)
-    SRRegressor(;
-        niterations           = budget,
-        populations           = 20,
-        population_size       = 40,
-        ncycles_per_iteration = 30,
-        binary_operators      = [+, -, *, safe_div],
-        unary_operators       = [abs, safe_sqrt, safe_log],
-        complexity_of_operators = [
-            (+) => 1, (-) => 1, (*) => 1, safe_div => 2,
-            abs => 1, safe_sqrt => 2, safe_log => 2
-        ],
-        complexity_of_constants = 1,
-        complexity_of_variables = 1,
-        maxsize = 10, maxdepth = 5,
-        parsimony = parsimony_mult * std(y_tr)^2,
-        adaptive_parsimony_scaling = 1.0,
-        loss_function = trading_loss,
-        elementwise_loss = nothing,
-        loss_scale = :linear,
-        batching = true, turbo = true, optimizer_probability = 0.01,
-    )
-end
-
-function fit_and_evaluate(X_tr, y_tr, X_te, y_te;
-                          ref_price = 1.0, budget = 200,
-                          parsimony_mult = 0.016)
-    model = _make_model(y_tr; budget=budget, parsimony_mult=parsimony_mult)
-
-    mach = machine(model, X_tr, y_tr)
-    fit!(mach, verbosity=0)
-
-    rep    = report(mach)
-    eq_str = string(rep.equations[rep.best_idx])
-
-    y_pred_te = predict(mach, (data = X_te, idx = rep.best_idx))
-    m = backtest_metrics(y_te, y_pred_te; ref_price = ref_price)
-
-    return eq_str, m
-end
-
-function shuffle_control(X_tr, y_tr, X_te, y_te;
-                         ref_price = 1.0, budget = 100)
-    model = _make_model(y_tr; budget=budget, parsimony_mult=0.016)
-
-    sh   = randperm(length(y_tr))
-    mach = machine(model, X_tr, y_tr[sh])
-    fit!(mach, verbosity=0)
-
-    y_pred_sh = predict(mach, X_te)
-    return backtest_metrics(y_te, y_pred_sh; ref_price=ref_price)
-end
-
-function walk_forward(X, yv; n_folds = 5, embargo = 2,
-                      ref_price = 1.0, budget = 100)
-    n = size(X, 1)
-    fold_size = n ÷ (n_folds + 1)
-    results    = NamedTuple[]
-    sh_results = NamedTuple[]
-
-    for k in 1:n_folds
-        train_end  = fold_size * k
-        test_start = train_end + 1 + embargo
-        test_end   = min(train_end + fold_size, n)
-
-        if train_end < 40 || test_start >= test_end - 5
-            continue
-        end
-
-        X_tr = X[1:train_end, :]
-        y_tr = yv[1:train_end]
-        X_te = X[test_start:test_end, :]
-        y_te = yv[test_start:test_end]
-
-        eq_str, m = fit_and_evaluate(X_tr, y_tr, X_te, y_te;
-                                     ref_price = ref_price, budget = budget)
-        m_sh = shuffle_control(X_tr, y_tr, X_te, y_te;
-                               ref_price = ref_price, budget = 100)
-
-        println(stderr, "  fold $k: n_tr=$(length(y_tr)) n_te=$(length(y_te)) ",
-                        "sharpe=$(round(m.sharpe,digits=2)) ",
-                        "t=$(round(m.t_stat,digits=2)) ",
-                        "bh=$(round(m.bh_sharpe,digits=2)) ",
-                        "shuffle=$(round(m_sh.sharpe,digits=2)) ",
-                        "eq=$eq_str")
-
-        vars_used = sort([m.match for m in eachmatch(r"x\d+", eq_str)])
-        println(stderr, "    vars: ", join(vars_used, ","))
-        
-        push!(results, m)
-        push!(sh_results, m_sh)
-    end
-
-    return results, sh_results
-end
-
-function aggregate_metrics(ms, sh_ms)
-    isempty(ms) && return nothing
-
-    s = [m.sharpe for m in ms if isfinite(m.sharpe)]
-    isempty(s) && return nothing
-
-    t  = [m.t_stat    for m in ms if isfinite(m.t_stat)]
-    bh = [m.bh_sharpe for m in ms if isfinite(m.bh_sharpe)]
-    sh = [m.sharpe    for m in sh_ms if isfinite(m.sharpe)]
-
-    pairs_sh = [(m.sharpe, s2.sharpe)
-                for (m, s2) in zip(ms, sh_ms)
-                if isfinite(m.sharpe) && isfinite(s2.sharpe)]
-    frac_beats_shuffle = isempty(pairs_sh) ? 0.0 :
-                         mean([a > b for (a, b) in pairs_sh])
-
-    pairs_bh = [(m.sharpe, m.bh_sharpe) for m in ms
-                if isfinite(m.sharpe) && isfinite(m.bh_sharpe)]
-    frac_beats_bh = isempty(pairs_bh) ? 0.0 :
-                    mean([a > b for (a, b) in pairs_bh])
+    equity_curve = cumsum(net_returns)
+    drawdown = minimum(equity_curve .- accumulate(max, equity_curve))
+    net_std = std(net_returns)
+    t_stat = net_std <= 1e-12 ? 0.0 : mean(net_returns) / net_std * sqrt(n)
 
     return (
-        sharpe             = median(s),
-        sharpe_mean        = mean(s),
-        sharpe_min         = minimum(s),
-        sharpe_std         = length(s) > 1 ? std(s) : 0.0,
-        frac_pos           = mean(s .> 0),
-        sortino            = median([m.sortino      for m in ms if isfinite(m.sortino)]),
-        max_drawdown       = minimum([m.max_drawdown for m in ms if isfinite(m.max_drawdown)]),
-        turnover           = mean([m.turnover       for m in ms if isfinite(m.turnover)]),
-        total_return       = sum([m.total_return    for m in ms if isfinite(m.total_return)]),
-        t_stat             = isempty(t)  ? 0.0 : median(t),
-        std_pred           = mean([m.std_pred  for m in ms if isfinite(m.std_pred)]),
-        bh_sharpe          = isempty(bh) ? 0.0 : median(bh),
-        shuffle_sharpe     = isempty(sh) ? 0.0 : median(sh),
-        frac_beats_shuffle = frac_beats_shuffle,
-        frac_beats_bh      = frac_beats_bh,
+        sharpe = sharpe_ratio(net_returns),
+        sortino = sortino_ratio(net_returns),
+        max_drawdown = finite_or_zero(drawdown),
+        turnover = finite_or_zero(sum(traded_notional)),
+        total_return = finite_or_zero(sum(net_returns)),
+        t_stat = finite_or_zero(t_stat),
+        std_pred = finite_or_zero(prediction_std),
+        bh_sharpe = sharpe_ratio(raw_returns),
     )
 end
 
-function discover(X::AbstractMatrix{Float64}, yv::Vector{Float64};
-                  ref_price = 1.0, k_bars = 2)
-    n = size(X, 1)
+function training_loss(tree, dataset, options)
+    prediction, completed = eval_tree_array(tree, dataset.X, options)
+    invalid = !completed || !all(isfinite, prediction) ||
+              length(prediction) < 2 || std(prediction) <= 1e-12
+    invalid && return Inf
 
-    println(stderr, "=== walk-forward ===")
-    wf_ms, sh_ms = walk_forward(X, yv; n_folds = 5, embargo = k_bars,
-                                ref_price = ref_price, budget = 100)
-    agg = aggregate_metrics(wf_ms, sh_ms)
+    signal = tanh.((prediction .- mean(prediction)) ./ std(prediction))
+    normalized_pnl = signal .* dataset.y
+    return std(normalized_pnl) <= 1e-12 ? Inf : exp(-mean(normalized_pnl) / std(normalized_pnl))
+end
 
-    if agg !== nothing
-        println(stderr,
-            "  aggregate: median_sharpe=$(round(agg.sharpe,digits=2)) ",
-            "mean_sharpe=$(round(agg.sharpe_mean,digits=2)) ",
-            "std_sharpe=$(round(agg.sharpe_std,digits=2)) ",
-            "min_sharpe=$(round(agg.sharpe_min,digits=2)) ",
-            "frac_pos=$(round(agg.frac_pos,digits=2)) ",
-            "median_t=$(round(agg.t_stat,digits=2)) ",
-            "bh=$(round(agg.bh_sharpe,digits=2)) ",
-            "shuffle=$(round(agg.shuffle_sharpe,digits=2)) ",
-            "beats_shuffle=$(round(agg.frac_beats_shuffle,digits=2)) ",
-            "beats_bh=$(round(agg.frac_beats_bh,digits=2))")
-    end
-
-    deploy = agg !== nothing &&
-             agg.sharpe             > 0.5 &&
-             agg.frac_pos           >= 0.6 &&
-             agg.t_stat             > 0.8 &&
-             agg.sharpe_min         > -1.0 &&
-             agg.frac_beats_shuffle >= 0.6 &&
-             agg.frac_beats_bh      >= 0.5
-
-    if !deploy
-        println(stderr, "  walk-forward weak → returning placeholder x1")
-        return "x1", 0, (
-            sharpe = 0.0, sortino = 0.0, max_drawdown = 0.0,
-            turnover = 0.0, total_return = 0.0,
-        )
-    end
-
-    println(stderr, "  deploying: final fit + holdout check")
-    hold = max(20, round(Int, 0.15 * n))
-    n_tr = n - hold
-    eq_str, m_hold = fit_and_evaluate(X[1:n_tr, :], yv[1:n_tr],
-                                      X[n_tr+1:end, :], yv[n_tr+1:end];
-                                      ref_price = ref_price, budget = 200)
-    println(stderr, "  deployed holdout: sharpe=$(round(m_hold.sharpe,digits=2)) ",
-                    "t=$(round(m_hold.t_stat,digits=2)) ",
-                    "bh=$(round(m_hold.bh_sharpe,digits=2)) eq=$eq_str")
-
-    if m_hold.sharpe <= 0.5 || m_hold.sharpe <= 0.5 * abs(m_hold.bh_sharpe)
-        println(stderr, "  holdout rejects deployed model → placeholder")
-        return "x1", 0, (
-            sharpe = 0.0, sortino = 0.0, max_drawdown = 0.0,
-            turnover = 0.0, total_return = 0.0,
-        )
-    end
-
-    return eq_str, n, (
-        sharpe       = _finite(m_hold.sharpe),
-        sortino      = _finite(m_hold.sortino),
-        max_drawdown = _finite(m_hold.max_drawdown),
-        turnover     = _finite(m_hold.turnover),
-        total_return = _finite(m_hold.total_return),
+function make_model(y_train; budget = 100, parsimony_multiplier = 0.016)
+    return SRRegressor(
+        niterations = budget,
+        populations = 20,
+        population_size = 40,
+        ncycles_per_iteration = 30,
+        binary_operators = [+, -, *, safe_div],
+        unary_operators = [abs, safe_sqrt, safe_log],
+        complexity_of_operators = [
+            (+) => 1, (-) => 1, (*) => 1, safe_div => 2,
+            abs => 1, safe_sqrt => 2, safe_log => 2,
+        ],
+        maxsize = 10,
+        maxdepth = 5,
+        parsimony = parsimony_multiplier * max(std(y_train)^2, 1e-12),
+        loss_function = training_loss,
+        elementwise_loss = nothing,
+        batching = true,
+        turbo = false,
     )
 end
 
-function main(io::IO = stdin)
+function fit_and_evaluate(X_train, y_train, X_valid, y_valid, valid_scales; budget = 100)
+    machine_model = machine(make_model(y_train; budget = budget), X_train, y_train)
+    fit!(machine_model, verbosity = 0)
+
+    report_data = report(machine_model)
+    equation = string(report_data.equations[report_data.best_idx])
+    validation_prediction = predict(machine_model, (data = X_valid, idx = report_data.best_idx))
+
+    return equation, backtest_metrics(y_valid, validation_prediction, valid_scales)
+end
+
+function shuffle_control(X_train, y_train, X_valid, y_valid, valid_scales; budget = 100)
+    shuffled_labels = y_train[randperm(length(y_train))]
+    machine_model = machine(make_model(y_train; budget = budget), X_train, shuffled_labels)
+    fit!(machine_model, verbosity = 0)
+
+    validation_prediction = predict(machine_model, X_valid)
+    return backtest_metrics(y_valid, validation_prediction, valid_scales)
+end
+
+function walk_forward(X, y, scales; n_folds = 5, embargo = 1, budget = 100)
+    n_samples = size(X, 1)
+    @info "Starting walk-forward with $(n_samples) samples, $(n_folds) folds, embargo=$(embargo)"
+    fold_size = div(n_samples, n_folds + 1)
+    fold_metrics = NamedTuple[]
+    shuffle_metrics = NamedTuple[]
+
+    for fold in 1:n_folds
+        train_end = fold * fold_size
+        validation_start = train_end + embargo + 1
+        validation_end = min(validation_start + fold_size - 1, n_samples)
+
+        if train_end < MIN_TRAIN_SAMPLES || validation_start > validation_end
+            @debug "Skipping fold $(fold): insufficient samples"
+            continue
+        end
+        @debug "Processing fold $(fold): train=1:$(train_end), validation=$(validation_start):$(validation_end)"
+
+        X_train = X[1:train_end, :]
+        y_train = y[1:train_end]
+        X_valid = X[validation_start:validation_end, :]
+        y_valid = y[validation_start:validation_end]
+        valid_scales = scales[validation_start:validation_end]
+
+        equation, metrics = fit_and_evaluate(X_train, y_train, X_valid, y_valid, valid_scales; budget = budget)
+        shuffled = shuffle_control(X_train, y_train, X_valid, y_valid, valid_scales; budget = budget)
+
+        @info "Fold $(fold) complete: train=1:$(train_end), validation=$(validation_start):$(validation_end), equation=$(equation)"
+        push!(fold_metrics, metrics)
+        push!(shuffle_metrics, shuffled)
+    end
+    @debug "Walk-forward produced $(length(fold_metrics)) valid folds"
+
+    return fold_metrics, shuffle_metrics
+end
+
+function aggregate_metrics(metrics, shuffled_metrics)
+    isempty(metrics) && return nothing
+
+    sharpes = [metric.sharpe for metric in metrics]
+    all(isfinite, sharpes) || return nothing
+
+    return (
+        sharpe = median(sharpes),
+        frac_pos = mean(sharpes .> 0),
+        t_stat = median([metric.t_stat for metric in metrics]),
+        sharpe_min = minimum(sharpes),
+        beats_shuffle = mean([metric.sharpe > shuffled.sharpe
+                              for (metric, shuffled) in zip(metrics, shuffled_metrics)]),
+        beats_bh = mean([metric.sharpe > metric.bh_sharpe for metric in metrics]),
+    )
+end
+
+function rejected(reason)
+    return (status = "rejected", equation = nothing, n = 0, metrics = nothing, reason = reason)
+end
+
+function discover(X, y, scales; k_bars = 1)
+    @info "Starting walk-forward validation"
+    metrics, shuffled_metrics = walk_forward(X, y, scales; embargo = k_bars)
+    @debug "Walk-forward complete: $(length(metrics)) folds"
+    
+    aggregate = aggregate_metrics(metrics, shuffled_metrics)
+
+    gates = if aggregate === nothing
+        Dict("folds" => false)
+    else
+        Dict(
+            "median_sharpe" => aggregate.sharpe > GATE_MEDIAN_SHARPE,
+            "positive_folds" => aggregate.frac_pos >= GATE_POSITIVE_FOLDS,
+            "t_stat" => aggregate.t_stat > GATE_T_STAT,
+            "minimum_sharpe" => aggregate.sharpe_min > GATE_MIN_SHARPE,
+            "beats_shuffle" => aggregate.beats_shuffle >= GATE_BEATS_SHUFFLE,
+            "beats_buy_hold" => aggregate.beats_bh >= GATE_BEATS_BUY_HOLD,
+        )
+    end
+    @info "Deployment gates: $(gates)"
+
+    if aggregate === nothing || !all(values(gates))
+        @warn "Walk-forward deployment gate failed"
+        return rejected("walk-forward deployment gate failed")
+    end
+
+    holdout_size = max(20, round(Int, 0.15 * size(X, 1)))
+    final_train_end = size(X, 1) - holdout_size
+    if final_train_end < MIN_TRAIN_SAMPLES
+        @warn "Insufficient final-fit history"
+        return rejected("insufficient final-fit history")
+    end
+    @info "Running final holdout evaluation with $(holdout_size) samples"
+
+    equation, holdout = fit_and_evaluate(
+        X[1:final_train_end, :], y[1:final_train_end],
+        X[final_train_end + 1:end, :], y[final_train_end + 1:end],
+        scales[final_train_end + 1:end]; budget = 200,
+    )
+    @debug "Holdout metrics: sharpe=$(holdout.sharpe), bh_sharpe=$(holdout.bh_sharpe)"
+    if holdout.sharpe <= GATE_MEDIAN_SHARPE || holdout.sharpe <= 0.5 * abs(holdout.bh_sharpe)
+        @warn "Final chronological holdout gate failed"
+        return rejected("final chronological holdout gate failed")
+    end
+    @info "Model accepted with equation: $(equation)"
+
+    return (
+        status = "accepted",
+        equation = equation,
+        n = size(X, 1),
+        metrics = (
+            sharpe = finite_or_zero(holdout.sharpe),
+            sortino = finite_or_zero(holdout.sortino),
+            max_drawdown = finite_or_zero(holdout.max_drawdown),
+            turnover = finite_or_zero(holdout.turnover),
+            total_return = finite_or_zero(holdout.total_return),
+        ),
+        reason = nothing,
+    )
+end
+
+function valid_input(rows, y, scales)
+    return length(rows) >= MIN_TRAIN_SAMPLES &&
+           all(isfinite, y) &&
+           all(scale -> isfinite(scale) && scale > 0, scales) &&
+           all(row -> length(row) == 11 && all(isfinite, row), rows)
+end
+
+function main(io = stdin)
+    @info "Starting Julia model execution"
     payload = JSON3.read(read(io, String))
+    @debug "Received payload with features count: $(length(payload.features))"
+    
+    rows = [Float64.(collect(row)) for row in payload.features]
+    y = Float64.(payload.target_scaled_return)
+    scales = Float64.(payload.target_scales)
 
-    xs = [Float64.(collect(row)) for row in payload.ts]
-    ys = Float64.(payload.target)
-    ref_price = Float64(get(payload, :ref_price, 1.0))
-    k_bars    = Int(get(payload, :k_bars, 2))
+    n = min(length(rows), length(y), length(scales))
+    rows, y, scales = rows[1:n], y[1:n], scales[1:n]
+    @info "Processing $(n) samples"
 
-    n  = min(length(xs), length(ys))
-    xs = xs[1:n]; ys = ys[1:n]
-
-    X  = to_matrix(xs)
-    eq, n_train, metrics = discover(X, ys; ref_price = ref_price, k_bars = k_bars)
-
-    JSON3.write(stdout, (equation = eq, n = n_train, metrics = metrics))
+    if !valid_input(rows, y, scales)
+        @warn "Input validation failed"
+        JSON3.write(stdout, rejected("invalid or insufficient feature/target data"))
+    else
+        @info "Input validated, starting discovery"
+        result = discover(rows_to_matrix(rows), y, scales; k_bars = Int(get(payload, :k_bars, 1)))
+        @info "Discovery complete, status: $(result.status)"
+        JSON3.write(stdout, result)
+    end
     println(stdout)
     flush(stdout)
+    @info "Julia model execution complete"
 end
 
-main()
+function selftest()
+    y_scaled = [1.0, -1.0]
+    prediction_scaled = [1.0, -1.0]
+    scales = [0.01, 0.01]
+
+    metrics = backtest_metrics(y_scaled, prediction_scaled, scales; cost_rate = 0.001)
+    @assert metrics.total_return < 0.02
+    @assert backtest_metrics(y_scaled, [1.0, 1.0], scales).turnover == 0.0
+    @assert discover(zeros(2, 11), [0.0, 0.0], [1.0, 1.0]).status == "rejected"
+end
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    "--test" in ARGS ? selftest() : main()
+end
