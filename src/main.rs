@@ -15,7 +15,7 @@ const VOL_WINDOW: usize = 20;
 const EPS: f64 = 1e-9;
 const LAG_BUF: usize = 8;
 const N_FEATS: usize = 11;
-const K_BARS: usize = 4;
+const K_BARS: usize = 1;
 
 #[derive(Deserialize, Debug)]
 struct Payload {
@@ -56,7 +56,7 @@ async fn fetch(
     let ticker = Ticker::new(&client, token);
 
     let mut history = ticker
-        .history(Some(Range::Y1), Some(Interval::I4h), false)
+        .history(Some(Range::Y2), Some(Interval::I1h), false)
         .await?;
 
     if let Some(last) = history.last() {
@@ -75,6 +75,7 @@ async fn fetch(
     let mut feat_hist: VecDeque<Vec<f64>> = VecDeque::with_capacity(LAG_BUF);
 
     let mut pending: VecDeque<(Vec<f64>, f64)> = VecDeque::with_capacity(K_BARS + 1);
+    let mut bars_since_sample: usize = 0;
 
     for candle in history {
         let ts = candle.ts;
@@ -127,12 +128,17 @@ async fn fetch(
             let sigma = ext[10].max(EPS);
 
             pending.push_back((ext, close));
+            bars_since_sample += 1;
 
-            while pending.len() > K_BARS {
+            if pending.len() > K_BARS {
                 let (past_feats, close_now) = pending.pop_front().unwrap();
-                let target = (close - close_now) / (close_now * sigma);
-                x.push(past_feats);
-                y.push(target);
+
+                if bars_since_sample >= K_BARS {
+                    bars_since_sample = 0;
+                    let target = (close - close_now) / (close_now * sigma);
+                    x.push(past_feats);
+                    y.push(target);
+                }
             }
         }
 
@@ -147,6 +153,20 @@ async fn fetch(
         if let Some(f) = feat_hist.back() {
             v[..6].copy_from_slice(f);
         }
+        let k = feat_hist.len();
+        if k >= 5 {
+            v[6] = feat_hist[k - 2][0]; // x7  lag1 ret_open
+            v[7] = feat_hist[k - 3][0]; // x8  lag2 ret_open
+            v[8] = feat_hist[k - 5][0]; // x9  lag4 ret_open
+
+            let last5: Vec<f64> =
+                feat_hist.iter().rev().take(5).map(|f| f[0]).collect();
+            let m = last5.iter().sum::<f64>() / last5.len() as f64;
+            let var = last5.iter().map(|z| (z - m).powi(2)).sum::<f64>()
+                    / last5.len() as f64;
+            v[9]  = m;          // x10
+            v[10] = var.sqrt(); // x11
+        }
         v
     };
 
@@ -158,6 +178,7 @@ fn run(ts: &[Vec<f64>], target: &[f64], ref_price: f64, path: &str) -> std::io::
         "ts":        ts,
         "target":    target,
         "ref_price": ref_price,
+        "k_bars":    K_BARS,
     });
 
     let mut child = Command::new(path)
@@ -186,10 +207,15 @@ fn approx_eq(a: &[f64], b: &[f64], eps: f64) -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    let token = &args[1];
+    let mut args: Vec<String> = env::args().collect();
+    // let token = &args[1];
     let range = "burmalda";
     let interval = "chemodan";
+
+    args.drain(0..1);
+    for arg in args {
+    let token = &arg;
+    eprintln!("{} START", token);
 
     let (x, y, last_features, first_ts, last_ts) = fetch(token, range, interval)?;
 
@@ -231,7 +257,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // --- /диагностика ---
 
-    let cache_valid = cfg.model != "x1" && same_window && same_data;
+    let metrics_ok  = cfg.metrics.as_ref().map_or(false, |m| m.sharpe > 0.5);
+    let cache_valid = cfg.model != "x1" && same_window && same_data && metrics_ok;
 
     let payload: Payload = if cache_valid {
         Payload {
@@ -262,6 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     mctx.func("inv_op",    |x| 1.0 / x);
 
+    mctx.func2("safe_div", |a: f64, b: f64| a / (b.abs() + 1e-4));
     mctx.func("safe_sqrt", |x| x.abs().sqrt());
     mctx.func("safe_log",  |x| (x.abs() + 1e-9).ln());
     mctx.func("safe_inv",  |x| {
@@ -270,26 +298,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     match meval::eval_str_with_context(&payload.equation, &mctx) {
-        Ok(func_result) => {
+        Ok(func_result) if payload.n > 0 => {
             println!(
-                "predicted return for next candle (n={}): {}",
-                payload.n, func_result
+                "predicted return for next candle of {} (n={}): {}",
+                token, payload.n, func_result
             );
+
+            let mean_y = y.iter().sum::<f64>() / y.len() as f64;
+            let std_y  = (y.iter().map(|z| (z - mean_y).powi(2)).sum::<f64>()
+                          / y.len() as f64).sqrt();
+            let z       = (func_result - mean_y) / std_y;
+            let capped_z = z.clamp(-3.0, 3.0);
+            let capped   = mean_y + capped_z * std_y;
+            eprintln!("[pred] raw={:.3} capped={:.3}", func_result, capped);
+        }
+        Ok(_) => {
+            eprintln!("[pred] skipped: no deployed model for {} (n=0)", token);
         }
         Err(e) => {
             eprintln!("calculation error: {}", e);
         }
     }
 
-    cfg.history  = y;
-    cfg.model    = payload.equation;
-    cfg.first_ts = first_ts;
-    cfg.last_ts  = last_ts;
-    cfg.metrics = payload.metrics;
-    let file = fs::File::create(&path)?;
-    let mut w = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut w, &cfg)?;
-    w.flush()?;
+    if payload.n > 0 {
+        cfg.history  = y;
+        cfg.model    = payload.equation;
+        cfg.first_ts = first_ts;
+        cfg.last_ts  = last_ts;
+        cfg.metrics  = payload.metrics;
+        let file = fs::File::create(&path)?;
+        let mut w = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut w, &cfg)?;
+        w.flush()?;
+    } else {
+        eprintln!("[cache] placeholder (n=0), checkpoint preserved");
+    }
 
+    eprintln!("{} END", token);
+
+    }
     Ok(())
 }
