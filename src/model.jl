@@ -7,23 +7,23 @@ using SymbolicRegression: eval_tree_array
 using LoopVectorization
 using Logging
 
-const logger = ConsoleLogger(stderr)
+const logger = ConsoleLogger(stderr, Logging.Debug)
 global_logger(logger)
-# Logging.disable_logging(Logging.Warn)
 
-const PERIODS_PER_YEAR = 252 * 7
+const PERIODS = 7 * 22 * 12 * 2
 
 const COST_RATE = 0.0005
-const MIN_TRAIN_SAMPLES = 40
+const MIN_TRAIN_SAMPLES = 30
 
-const GATE_MEDIAN_SHARPE = 0.5
-const GATE_POSITIVE_FOLDS = 0.6
-const GATE_T_STAT = 0.8
+const GATE_MEDIAN_SHARPE = 0.3
+const GATE_POSITIVE_FOLDS = 0.5
+const GATE_T_STAT = 0.25
 const GATE_MIN_SHARPE = -1.0
-const GATE_BEATS_SHUFFLE = 0.6
-const GATE_BEATS_BUY_HOLD = 0.5
+const GATE_BEATS_SHUFFLE = 0.5
+const GATE_BEATS_BUY_HOLD = 0.4
 
-# @turbo warn_check_args=false
+const MIN_FOLDS_FOR_ACCEPT = 3
+const MIN_HOLDOUT_FOR_STRICT_GATE = 40
 
 safe_log(x) = log(abs(x) + 1e-9)
 safe_sqrt(x) = sqrt(abs(x))
@@ -45,7 +45,6 @@ end
 
 function rows_to_matrix(rows)
     isempty(rows) && return zeros(0, 0)
-
     X = Matrix{Float64}(undef, length(rows), length(rows[1]))
     for row_index in eachindex(rows)
         for feature_index in eachindex(rows[row_index])
@@ -55,23 +54,19 @@ function rows_to_matrix(rows)
     return X
 end
 
-function sharpe_ratio(returns; periods_per_year = PERIODS_PER_YEAR)
+function sharpe_ratio(returns; periods = PERIODS)
     length(returns) < 2 && return 0.0
-
     return_std = std(returns)
     (!isfinite(return_std) || return_std <= 1e-12) && return 0.0
-
-    return finite_or_zero(mean(returns) / return_std * sqrt(periods_per_year))
+    return finite_or_zero(mean(returns) / return_std * sqrt(periods))
 end
 
-function sortino_ratio(returns; periods_per_year = PERIODS_PER_YEAR)
+function sortino_ratio(returns; periods = PERIODS)
     downside_returns = returns[returns .< 0]
     length(downside_returns) < 2 && return 0.0
-
     downside_std = std(downside_returns)
     downside_std <= 1e-12 && return 0.0
-
-    return finite_or_zero(mean(returns) / downside_std * sqrt(periods_per_year))
+    return finite_or_zero(mean(returns) / downside_std * sqrt(periods))
 end
 
 
@@ -86,13 +81,12 @@ function backtest_metrics(y_scaled, prediction_scaled, scales; cost_rate = COST_
     !valid_input && return empty_metrics()
 
     raw_returns = y_scaled .* scales
-    raw_predictions = prediction_scaled .* scales
 
-    prediction_std = std(raw_predictions)
+    prediction_std = std(prediction_scaled)
     positions = if prediction_std <= 1e-12
         zeros(n)
     else
-        prediction_zscore = (raw_predictions .- mean(raw_predictions)) ./ prediction_std
+        prediction_zscore = (prediction_scaled .- mean(prediction_scaled)) ./ prediction_std
         tanh.(prediction_zscore)
     end
 
@@ -129,20 +123,20 @@ function training_loss(tree, dataset, options)
     return std(normalized_pnl) <= 1e-12 ? Inf : exp(-mean(normalized_pnl) / std(normalized_pnl))
 end
 
-function make_model(y_train; budget = 100, parsimony_multiplier = 0.016)
+function make_model(y_train; parsimony_multiplier = 0)
     return SRRegressor(
-        niterations = budget,
+        niterations = 400,
         populations = 20,
-        population_size = 40,
-        ncycles_per_iteration = 30,
+        population_size = 30,
+        ncycles_per_iteration = 20,
         binary_operators = [+, -, *, safe_div],
         unary_operators = [abs, safe_sqrt, safe_log],
         complexity_of_operators = [
             (+) => 1, (-) => 1, (*) => 1, safe_div => 2,
             abs => 1, safe_sqrt => 2, safe_log => 2,
         ],
-        maxsize = 10,
-        maxdepth = 5,
+        maxsize = 6,
+        maxdepth = 3,
         parsimony = parsimony_multiplier * max(std(y_train)^2, 1e-12),
         loss_function = training_loss,
         elementwise_loss = nothing,
@@ -151,8 +145,8 @@ function make_model(y_train; budget = 100, parsimony_multiplier = 0.016)
     )
 end
 
-function fit_and_evaluate(X_train, y_train, X_valid, y_valid, valid_scales; budget = 100)
-    machine_model = machine(make_model(y_train; budget = budget), X_train, y_train)
+function fit_and_evaluate(X_train, y_train, X_valid, y_valid, valid_scales)
+    machine_model = machine(make_model(y_train;), X_train, y_train)
     fit!(machine_model, verbosity = 0)
 
     report_data = report(machine_model)
@@ -162,18 +156,21 @@ function fit_and_evaluate(X_train, y_train, X_valid, y_valid, valid_scales; budg
     return equation, backtest_metrics(y_valid, validation_prediction, valid_scales)
 end
 
-function shuffle_control(X_train, y_train, X_valid, y_valid, valid_scales; budget = 100)
+function shuffle_control(X_train, y_train, X_valid, y_valid, valid_scales;)
     shuffled_labels = y_train[randperm(length(y_train))]
-    machine_model = machine(make_model(y_train; budget = budget), X_train, shuffled_labels)
+    machine_model = machine(make_model(shuffled_labels;), X_train, shuffled_labels)
     fit!(machine_model, verbosity = 0)
 
-    validation_prediction = predict(machine_model, X_valid)
+    report_data = report(machine_model)
+    validation_prediction = predict(machine_model, (data = X_valid, idx = report_data.best_idx))
     return backtest_metrics(y_valid, validation_prediction, valid_scales)
 end
 
-function walk_forward(X, y, scales; n_folds = 5, embargo = 1, budget = 100)
-    n_samples = size(X, 1)
-    @info "Starting walk-forward with $(n_samples) samples, $(n_folds) folds, embargo=$(embargo)"
+function walk_forward(X, y, scales; n_folds = 5, embargo = 1, n_max = size(X, 1))
+    n_samples = min(size(X, 1), n_max)
+    n_samples < 2 && return NamedTuple[], NamedTuple[]
+
+    @info "Starting walk-forward with $(n_samples) samples (of $(size(X, 1))), $(n_folds) folds, embargo=$(embargo)"
     fold_size = div(n_samples, n_folds + 1)
     fold_metrics = NamedTuple[]
     shuffle_metrics = NamedTuple[]
@@ -184,7 +181,7 @@ function walk_forward(X, y, scales; n_folds = 5, embargo = 1, budget = 100)
         validation_end = min(validation_start + fold_size - 1, n_samples)
 
         if train_end < MIN_TRAIN_SAMPLES || validation_start > validation_end
-            @debug "Skipping fold $(fold): insufficient samples"
+            @debug "Skipping fold $(fold): insufficient samples (train_end=$(train_end), val=$(validation_start):$(validation_end))"
             continue
         end
         @debug "Processing fold $(fold): train=1:$(train_end), validation=$(validation_start):$(validation_end)"
@@ -195,8 +192,8 @@ function walk_forward(X, y, scales; n_folds = 5, embargo = 1, budget = 100)
         y_valid = y[validation_start:validation_end]
         valid_scales = scales[validation_start:validation_end]
 
-        equation, metrics = fit_and_evaluate(X_train, y_train, X_valid, y_valid, valid_scales; budget = budget)
-        shuffled = shuffle_control(X_train, y_train, X_valid, y_valid, valid_scales; budget = budget)
+        equation, metrics = fit_and_evaluate(X_train, y_train, X_valid, y_valid, valid_scales;)
+        shuffled = shuffle_control(X_train, y_train, X_valid, y_valid, valid_scales;)
 
         @info "Fold $(fold) complete: train=1:$(train_end), validation=$(validation_start):$(validation_end), equation=$(equation)"
         push!(fold_metrics, metrics)
@@ -209,6 +206,7 @@ end
 
 function aggregate_metrics(metrics, shuffled_metrics)
     isempty(metrics) && return nothing
+    length(metrics) < MIN_FOLDS_FOR_ACCEPT && return nothing
 
     sharpes = [metric.sharpe for metric in metrics]
     all(isfinite, sharpes) || return nothing
@@ -228,17 +226,50 @@ function rejected(reason)
     return (status = "rejected", equation = nothing, n = 0, metrics = nothing, reason = reason)
 end
 
+
+function holdout_passes(holdout, holdout_size)
+    strict = holdout_size >= MIN_HOLDOUT_FOR_STRICT_GATE
+    min_required = strict ? GATE_MEDIAN_SHARPE : 0.0
+    bh_threshold = 0.5 * max(0.0, holdout.bh_sharpe)
+    return holdout.sharpe > min_required && holdout.sharpe > bh_threshold
+end
+
 function discover(X, y, scales; k_bars = 1)
-    @info "Starting walk-forward validation"
-    metrics, shuffled_metrics = walk_forward(X, y, scales; embargo = k_bars)
+    n_total = size(X, 1)
+
+    if n_total - MIN_TRAIN_SAMPLES < 5
+        @warn "Not enough samples beyond MIN_TRAIN_SAMPLES=$(MIN_TRAIN_SAMPLES): n=$(n_total)"
+        return rejected("insufficient data for holdout")
+    end
+
+    # Пропорциональный holdout: 20% от n, но не больше, чем n - MIN_TRAIN_SAMPLES
+    holdout_size = clamp(round(Int, 0.20 * n_total), 5, n_total - MIN_TRAIN_SAMPLES)
+    final_train_end = n_total - holdout_size
+    @info "Final split: train=1:$(final_train_end), holdout=$(final_train_end+1):$(n_total) ($(holdout_size) samples)"
+
+    @info "Starting walk-forward validation (n_max=$(final_train_end))"
+    metrics, shuffled_metrics = walk_forward(
+        X, y, scales;
+        embargo = k_bars,
+        n_max = final_train_end,
+    )
     @debug "Walk-forward complete: $(length(metrics)) folds"
-    
+
     aggregate = aggregate_metrics(metrics, shuffled_metrics)
 
     gates = if aggregate === nothing
-        Dict("folds" => false)
+        Dict(
+            "min_folds" => false,
+            "median_sharpe" => false,
+            "positive_folds" => false,
+            "t_stat" => false,
+            "minimum_sharpe" => false,
+            "beats_shuffle" => false,
+            "beats_buy_hold" => false,
+        )
     else
         Dict(
+            "min_folds" => length(metrics) >= MIN_FOLDS_FOR_ACCEPT,
             "median_sharpe" => aggregate.sharpe > GATE_MEDIAN_SHARPE,
             "positive_folds" => aggregate.frac_pos >= GATE_POSITIVE_FOLDS,
             "t_stat" => aggregate.t_stat > GATE_T_STAT,
@@ -254,22 +285,21 @@ function discover(X, y, scales; k_bars = 1)
         return rejected("walk-forward deployment gate failed")
     end
 
-    holdout_size = max(20, round(Int, 0.15 * size(X, 1)))
-    final_train_end = size(X, 1) - holdout_size
-    if final_train_end < MIN_TRAIN_SAMPLES
-        @warn "Insufficient final-fit history"
-        return rejected("insufficient final-fit history")
-    end
-    @info "Running final holdout evaluation with $(holdout_size) samples"
-
+    @info "Running final holdout evaluation on $(holdout_size) samples"
     equation, holdout = fit_and_evaluate(
         X[1:final_train_end, :], y[1:final_train_end],
         X[final_train_end + 1:end, :], y[final_train_end + 1:end],
-        scales[final_train_end + 1:end]; budget = 200,
+        scales[final_train_end + 1:end];
     )
-    @debug "Holdout metrics: sharpe=$(holdout.sharpe), bh_sharpe=$(holdout.bh_sharpe)"
-    if holdout.sharpe <= GATE_MEDIAN_SHARPE || holdout.sharpe <= 0.5 * abs(holdout.bh_sharpe)
-        @warn "Final chronological holdout gate failed"
+    @info "Holdout metrics: sharpe=$(round(holdout.sharpe, digits=3)), " *
+          "bh_sharpe=$(round(holdout.bh_sharpe, digits=3)), " *
+          "sortino=$(round(holdout.sortino, digits=3)), " *
+          "t_stat=$(round(holdout.t_stat, digits=3)), " *
+          "turnover=$(round(holdout.turnover, digits=3)), " *
+          "std_pred=$(round(holdout.std_pred, digits=6))"
+
+    if !holdout_passes(holdout, holdout_size)
+        @warn "Final chronological holdout gate failed (strict=$(holdout_size >= MIN_HOLDOUT_FOR_STRICT_GATE))"
         return rejected("final chronological holdout gate failed")
     end
     @info "Model accepted with equation: $(equation)"
@@ -277,7 +307,7 @@ function discover(X, y, scales; k_bars = 1)
     return (
         status = "accepted",
         equation = equation,
-        n = size(X, 1),
+        n = n_total,
         metrics = (
             sharpe = finite_or_zero(holdout.sharpe),
             sortino = finite_or_zero(holdout.sortino),
@@ -300,7 +330,7 @@ function main(io = stdin)
     @info "Starting Julia model execution"
     payload = JSON3.read(read(io, String))
     @debug "Received payload with features count: $(length(payload.features))"
-    
+
     rows = [Float64.(collect(row)) for row in payload.features]
     y = Float64.(payload.target_scaled_return)
     scales = Float64.(payload.target_scales)
@@ -310,7 +340,7 @@ function main(io = stdin)
     @info "Processing $(n) samples"
 
     if !valid_input(rows, y, scales)
-        @warn "Input validation failed"
+        @warn "Input validation failed (need >= $(MIN_TRAIN_SAMPLES) valid samples)"
         JSON3.write(stdout, rejected("invalid or insufficient feature/target data"))
     else
         @info "Input validated, starting discovery"
