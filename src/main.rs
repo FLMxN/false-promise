@@ -17,7 +17,7 @@ const N_FEATS: usize = 11;
 const K_BARS: usize = 1;
 const MIN_SIGMA: f64 = 1e-8;
 
-const MODEL_VERSION: &str = "2026-09-27/features-v2/close-close-scaled-v2/cost-return-v2/wf-v2";
+const MODEL_VERSION: &str = "2026-09-27/features-v2/close-close-scaled-v2/cost-return-v2/wf-v3";
 
 #[derive(Deserialize, Debug)]
 struct Payload {
