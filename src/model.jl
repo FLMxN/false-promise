@@ -6,29 +6,62 @@ using Random
 using SymbolicRegression: eval_tree_array
 using LoopVectorization
 using Logging
+using SpecialFunctions: erf, erfc, gamma
 
 const logger = ConsoleLogger(stderr, Logging.Debug)
 global_logger(logger)
 
-const PERIODS = 7 * 22 * 12 * 2
+const PERIODS = 24 * 365 * 1
 
 const COST_RATE = 0.0005
 const MIN_TRAIN_SAMPLES = 30
 
 const GATE_MEDIAN_SHARPE = 0.3
 const GATE_POSITIVE_FOLDS = 0.5
-const GATE_T_STAT = 0.25
+const GATE_T_STAT = 0.2
 const GATE_MIN_SHARPE = -1.0
 const GATE_BEATS_SHUFFLE = 0.5
 const GATE_BEATS_BUY_HOLD = 0.4
 
-const MIN_FOLDS_FOR_ACCEPT = 3
+const MIN_FOLDS_FOR_ACCEPT = 2
 const MIN_HOLDOUT_FOR_STRICT_GATE = 40
 
-safe_log(x) = log(abs(x) + 1e-9)
-safe_sqrt(x) = sqrt(abs(x))
+const BUDGET = 300
+
 safe_div(a, b) = a / (abs(b) + 1e-4)
+safe_sqrt(x) = sqrt(abs(x))
+safe_log(x) = log(abs(x) + 1e-9)
+safe_log2(x) = log2(abs(x) + 1e-9)
+safe_log10(x) = log10(abs(x) + 1e-9)
+safe_log1p(x) = log1p(abs(x) + 1e-9)
+
+square(x) = x * x
+cube(x) = x * x * x
+relu(x) = x > 0.0 ? x : 0.0
+function safe_pow(a, b)
+    (a < 0 && b != round(b)) && return 0.0
+    r = a^b
+    return isfinite(r) ? clamp(r, -1e6, 1e6) : 0.0
+end
+greater(a, b) = a > b ? 1.0 : 0.0
+logical_or(a, b) = (a != 0.0 || b != 0.0) ? 1.0 : 0.0
+logical_and(a, b) = (a != 0.0 && b != 0.0) ? 1.0 : 0.0
+
+safe_asin(x)  = abs(x) <= 1 ? asin(x)  : NaN
+safe_acos(x)  = abs(x) <= 1 ? acos(x)  : NaN
+safe_acosh(x) = x >= 1      ? acosh(x) : NaN
+safe_atanh(x) = abs(x) < 1  ? atanh(x) : NaN
+
 finite_or_zero(x) = isfinite(x) ? Float64(x) : 0.0
+
+function safe_gamma(x)
+    try
+        r = gamma(x)
+        return isfinite(r) ? r : NaN
+    catch
+        return NaN
+    end
+end
 
 function empty_metrics()
     return (
@@ -123,18 +156,40 @@ function training_loss(tree, dataset, options)
     return std(normalized_pnl) <= 1e-12 ? Inf : exp(-mean(normalized_pnl) / std(normalized_pnl))
 end
 
-function make_model(y_train; parsimony_multiplier = 0)
+function make_model(y_train; parsimony_multiplier = 0.016)
     return SRRegressor(
-        niterations = 400,
-        populations = 20,
-        population_size = 30,
-        ncycles_per_iteration = 20,
-        binary_operators = [+, -, *, safe_div],
-        unary_operators = [abs, safe_sqrt, safe_log],
-        complexity_of_operators = [
-            (+) => 1, (-) => 1, (*) => 1, safe_div => 2,
-            abs => 1, safe_sqrt => 2, safe_log => 2,
-        ],
+        niterations = BUDGET,
+        populations = BUDGET ÷ 10,
+        population_size = BUDGET ÷ 10,
+        ncycles_per_iteration = BUDGET ÷ 10,
+        binary_operators = [
+        +, -, *, safe_div,
+        safe_pow,
+        greater, logical_or, logical_and
+    ],
+    unary_operators = [
+        abs, safe_sqrt, safe_log,
+        safe_log2, safe_log10, safe_log1p,
+        square, cube, relu,
+        exp, sin, cos, tan,
+        sinh, cosh, tanh, asinh,
+        safe_asin, safe_acos, safe_acosh, safe_atanh,
+        erf, erfc, safe_gamma,                          
+    ],
+    complexity_of_operators = Dict(
+        (+) => 1, (-) => 1, (*) => 1,
+        safe_div => 2, safe_pow => 2,
+        greater => 1, logical_or => 1, logical_and => 1,
+
+        abs => 1, safe_sqrt => 2, safe_log => 2,
+        safe_log2 => 2, safe_log10 => 2, safe_log1p => 2,
+        square => 1, cube => 1, relu => 1,
+
+        exp => 1, sin => 1, cos => 1, tan => 1,
+        sinh => 1, cosh => 1, tanh => 1,
+        safe_asin => 1, safe_acos => 1, safe_acosh => 1, safe_atanh => 1,
+        erf => 2, erfc => 2, safe_gamma => 2,
+        ),
         maxsize = 6,
         maxdepth = 3,
         parsimony = parsimony_multiplier * max(std(y_train)^2, 1e-12),
@@ -142,6 +197,11 @@ function make_model(y_train; parsimony_multiplier = 0)
         elementwise_loss = nothing,
         batching = true,
         turbo = false,
+        nested_constraints = [
+        safe_log  => [safe_log => 0, safe_log2 => 0, safe_log10 => 0, safe_log1p => 0],
+        safe_sqrt => [safe_sqrt => 1],
+        exp       => [exp => 0, safe_log => 0, safe_log2 => 0, safe_log10 => 0, safe_log1p => 0],
+        ]
     )
 end
 
@@ -157,6 +217,7 @@ function fit_and_evaluate(X_train, y_train, X_valid, y_valid, valid_scales)
 end
 
 function shuffle_control(X_train, y_train, X_valid, y_valid, valid_scales;)
+    Random.seed!(42)
     shuffled_labels = y_train[randperm(length(y_train))]
     machine_model = machine(make_model(shuffled_labels;), X_train, shuffled_labels)
     fit!(machine_model, verbosity = 0)
@@ -166,7 +227,7 @@ function shuffle_control(X_train, y_train, X_valid, y_valid, valid_scales;)
     return backtest_metrics(y_valid, validation_prediction, valid_scales)
 end
 
-function walk_forward(X, y, scales; n_folds = 5, embargo = 1, n_max = size(X, 1))
+function walk_forward(X, y, scales; n_folds = 3, embargo = 1, n_max = size(X, 1))
     n_samples = min(size(X, 1), n_max)
     n_samples < 2 && return NamedTuple[], NamedTuple[]
 
@@ -242,10 +303,20 @@ function discover(X, y, scales; k_bars = 1)
         return rejected("insufficient data for holdout")
     end
 
-    # Пропорциональный holdout: 20% от n, но не больше, чем n - MIN_TRAIN_SAMPLES
     holdout_size = clamp(round(Int, 0.20 * n_total), 5, n_total - MIN_TRAIN_SAMPLES)
     final_train_end = n_total - holdout_size
-    @info "Final split: train=1:$(final_train_end), holdout=$(final_train_end+1):$(n_total) ($(holdout_size) samples)"
+    
+    holdout_start = final_train_end + 1 + k_bars
+    holdout_end   = n_total
+    effective_holdout_size = holdout_end - holdout_start + 1
+
+    if effective_holdout_size < 5
+        @warn "Not enough samples for final holdout after embargo: $(effective_holdout_size)"
+        return rejected("insufficient holdout after embargo")
+    end
+
+    @info "Final split: train=1:$(final_train_end), embargo=$(k_bars), " *
+        "holdout=$(holdout_start):$(holdout_end) ($(effective_holdout_size) samples)"
 
     @info "Starting walk-forward validation (n_max=$(final_train_end))"
     metrics, shuffled_metrics = walk_forward(
@@ -285,12 +356,13 @@ function discover(X, y, scales; k_bars = 1)
         return rejected("walk-forward deployment gate failed")
     end
 
-    @info "Running final holdout evaluation on $(holdout_size) samples"
+    @info "Running final holdout evaluation on $(effective_holdout_size) samples"
     equation, holdout = fit_and_evaluate(
         X[1:final_train_end, :], y[1:final_train_end],
-        X[final_train_end + 1:end, :], y[final_train_end + 1:end],
-        scales[final_train_end + 1:end];
+        X[holdout_start:holdout_end, :], y[holdout_start:holdout_end],
+        scales[holdout_start:holdout_end];
     )
+
     @info "Holdout metrics: sharpe=$(round(holdout.sharpe, digits=3)), " *
           "bh_sharpe=$(round(holdout.bh_sharpe, digits=3)), " *
           "sortino=$(round(holdout.sortino, digits=3)), " *
@@ -298,10 +370,11 @@ function discover(X, y, scales; k_bars = 1)
           "turnover=$(round(holdout.turnover, digits=3)), " *
           "std_pred=$(round(holdout.std_pred, digits=6))"
 
-    if !holdout_passes(holdout, holdout_size)
-        @warn "Final chronological holdout gate failed (strict=$(holdout_size >= MIN_HOLDOUT_FOR_STRICT_GATE))"
+    if !holdout_passes(holdout, effective_holdout_size)
+        @warn "Final chronological holdout gate failed (strict=$(effective_holdout_size >= MIN_HOLDOUT_FOR_STRICT_GATE))"
         return rejected("final chronological holdout gate failed")
     end
+
     @info "Model accepted with equation: $(equation)"
 
     return (

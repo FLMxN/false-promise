@@ -10,6 +10,7 @@ use std::{
     process::{Command, Stdio},
 };
 use yfinance_rs::{Interval, Range, Ticker, YfClient};
+use libm;
 
 const VOL_WINDOW: usize = 20;
 const FEATURE_WINDOW: usize = 5;
@@ -95,6 +96,7 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
             || !finite_positive(bar.close)
             || bar.volume < 0.0
         {
+            pending = None;
             continue;
         }
         if first_ts == 0 {
@@ -151,6 +153,8 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
                                 }
                                 last_features = features.clone();
                                 pending = Some((features, bar.close, sigma));
+                            } else {
+                                pending = None;
                             }
                         }
                     }
@@ -181,7 +185,7 @@ async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
     let client = YfClient::default();
     let ticker = Ticker::new(&client, token);
     let history = ticker
-        .history(Some(Range::Y2), Some(Interval::I1h), false)
+        .history(Some(Range::Y1), Some(Interval::I1h), false)
         .await?;
     let now = Utc::now();
 
@@ -245,6 +249,50 @@ fn checkpoint_is_valid(c: &Checkpoint, data: &Dataset) -> bool {
         && c.last_ts == data.last_ts
         && approx_eq(&c.history, &data.target_scaled_return)
 }
+
+fn build_context(features: &[f64]) -> meval::Context {
+    let mut ctx = meval::Context::new();
+
+    for (i, v) in features.iter().enumerate() {
+        ctx.var(format!("x{}", i + 1), *v);
+    }
+
+    ctx.func("safe_asin",  |x| if x.abs() <= 1.0 { x.asin()  } else { f64::NAN });
+    ctx.func("safe_acos",  |x| if x.abs() <= 1.0 { x.acos()  } else { f64::NAN });
+    ctx.func("safe_acosh", |x| if x >= 1.0      { x.acosh() } else { f64::NAN });
+    ctx.func("safe_atanh", |x| if x.abs() <  1.0 { x.atanh() } else { f64::NAN });
+    ctx.func("safe_gamma", |x| {
+        let r = libm::tgamma(x);
+        if r.is_finite() { r } else { f64::NAN }
+    });
+
+    ctx.func2("safe_div", |a, b| a / (b.abs() + 1e-4));
+    ctx.func("safe_sqrt", |x| x.abs().sqrt());
+    ctx.func("safe_log", |x| (x.abs() + 1e-9).ln());
+    ctx.func("safe_log2", |x| (x.abs() + 1e-9).log2());
+    ctx.func("safe_log10", |x| (x.abs() + 1e-9).log10());
+    ctx.func("safe_log1p", |x| (x.abs() + 1e-9).ln_1p());
+
+    ctx.func("square", |x| x * x);
+    ctx.func("cube", |x| x * x * x);
+    ctx.func("relu", |x| if x > 0.0 { x } else { 0.0 });
+    ctx.func("sign", |x| x.signum());
+    ctx.func("signum", |x| x.signum());
+
+    ctx.func("erf", |x| libm::erf(x));
+    ctx.func("erfc", |x| libm::erfc(x));
+
+    ctx.func2("safe_pow", |a, b| {
+        let r = a.powf(b);
+        if r.is_finite() { r.clamp(-1e6, 1e6) } else { 0.0 }
+    });
+    ctx.func2("greater", |a, b| if a > b { 1.0 } else { 0.0 });
+    ctx.func2("logical_or", |a, b| if a != 0.0 || b != 0.0 { 1.0 } else { 0.0 });
+    ctx.func2("logical_and", |a, b| if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 });
+
+    ctx
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("debug")
@@ -321,13 +369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_deref()
             .ok_or("accepted model without equation")?;
         debug!("Evaluating equation: {}", equation);
-        let mut ctx = meval::Context::new();
-        for (i, v) in data.last_features.iter().enumerate() {
-            ctx.var(format!("x{}", i + 1), *v);
-        }
-        ctx.func2("safe_div", |a, b| a / (b.abs() + 1e-4));
-        ctx.func("safe_sqrt", |a| a.abs().sqrt());
-        ctx.func("safe_log", |a| (a.abs() + 1e-9).ln());
+        let ctx = build_context(&data.last_features);
         match meval::eval_str_with_context(equation, &ctx) {
             Ok(p) if p.is_finite() => {
                 info!("Prediction for {}: {}", token, p);
