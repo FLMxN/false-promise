@@ -130,7 +130,10 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
         if let Some((past_features, past_close, past_sigma)) = pending.take() {
             let target_return = (bar.close - past_close) / past_close;
             let scaled = target_return / past_sigma;
-            if target_return.is_finite() && scaled.is_finite() {
+            if target_return.is_finite()
+                && scaled.is_finite()
+                && (bar.ts != last_ts || target_return != 0.0)
+            {
                 x.push(past_features);
                 target_scaled_return.push(scaled);
                 target_scales.push(past_sigma);
@@ -209,7 +212,7 @@ async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
     let client = YfClient::default();
     let ticker = Ticker::new(&client, token);
     let history = ticker
-        .history(Some(Range::M3), Some(Interval::I1h), false)
+        .history(Some(Range::M6), Some(Interval::I4h), false)
         .await?;
     let now = Utc::now();
 
@@ -475,6 +478,18 @@ mod tests {
         let d = build_dataset(&bars());
         assert!(!d.x.is_empty());
         assert!(d.x.iter().all(|r| r.len() == N_FEATS && all_finite(r)));
+        assert_eq!(d.x.len(), d.target_scales.len());
+        assert_eq!(d.x.len(), d.target_timestamps.len());
+    }
+    #[test]
+    fn zero_target_on_last_candle_is_dropped() {
+        let mut b = bars();
+        let last = b.len() - 1;
+        b[last].close = b[last - 1].close;
+
+        let d = build_dataset(&b);
+
+        assert_ne!(d.target_timestamps.last(), Some(&b[last].ts));
         assert_eq!(d.x.len(), d.target_scales.len());
         assert_eq!(d.x.len(), d.target_timestamps.len());
     }

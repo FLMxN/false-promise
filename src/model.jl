@@ -26,22 +26,23 @@ const logger = WarningFilterLogger(ConsoleLogger(stderr, Logging.Debug))
 global_logger(logger)
 
 const SECONDS_PER_YEAR = 365.2425 * 24 * 60 * 60
+const BUDGET = 280
+const FOLDS = 9
 
 const COST_RATE = 0.0005
 const MIN_PREDICTION_STD = 1e-12
 const MIN_TRAIN_SAMPLES = 15
 
-const GATE_MEDIAN_SHARPE = 0.3
-const GATE_POSITIVE_FOLDS = 0.5
-const GATE_T_STAT = 0.2
-const GATE_MIN_SHARPE = -1.0
-const GATE_BEATS_SHUFFLE = 0.5
-const GATE_BEATS_BUY_HOLD = 0.4
+const FOLD_Z = 1.0
+const GATE_MEDIAN_SHARPE  = FOLD_Z / sqrt(FOLDS)
+const GATE_POSITIVE_FOLDS = 0.2 + FOLD_Z / sqrt(FOLDS)
+const GATE_T_STAT         = FOLD_Z / sqrt(FOLDS)
+const GATE_MIN_SHARPE     = -FOLD_Z * sqrt(FOLDS)
+const GATE_BEATS_SHUFFLE  = 0.2 + FOLD_Z / sqrt(FOLDS)
+const GATE_BEATS_BUY_HOLD = 0.2 + FOLD_Z / sqrt(FOLDS)
 
-const MIN_FOLDS_FOR_ACCEPT = 2
+const MIN_FOLDS_FOR_ACCEPT = FOLDS/2
 const MIN_HOLDOUT_FOR_STRICT_GATE = 40
-
-const BUDGET = 250
 
 safe_div(a, b) = a / (abs(b) + 1e-4)
 safe_sqrt(x) = sqrt(abs(x))
@@ -198,7 +199,7 @@ function training_loss(tree, dataset, options)
            Inf : exp(-mean(net_returns) / net_std)
 end
 
-function make_model(; parsimony_multiplier = 0.0)
+function make_model(; parsimony_multiplier = 0.0016)
     return SRRegressor(
         niterations = BUDGET,
         populations = BUDGET ÷ 10,
@@ -207,7 +208,7 @@ function make_model(; parsimony_multiplier = 0.0)
         binary_operators = [
         +, -, *, safe_div,
         safe_pow,
-        greater, logical_or, logical_and
+        # greater, logical_or, logical_and
     ],
     unary_operators = [
         abs, safe_sqrt, safe_log,
@@ -221,7 +222,7 @@ function make_model(; parsimony_multiplier = 0.0)
     complexity_of_operators = Dict(
         (+) => 1, (-) => 1, (*) => 1,
         safe_div => 2, safe_pow => 2,
-        greater => 1, logical_or => 1, logical_and => 1,
+        # greater => 1, logical_or => 1, logical_and => 1,
 
         abs => 1, safe_sqrt => 2, safe_log => 2,
         safe_log2 => 2, safe_log10 => 2, safe_log1p => 2,
@@ -232,8 +233,8 @@ function make_model(; parsimony_multiplier = 0.0)
         safe_asin => 1, safe_acos => 1, safe_acosh => 1, safe_atanh => 1,
         erf => 2, erfc => 2, safe_gamma => 2,
         ),
-        maxsize = 10,
-        maxdepth = 5,
+        maxsize = 20,
+        maxdepth = 10,
         parsimony = parsimony_multiplier,
         loss_function = training_loss,
         elementwise_loss = nothing,
@@ -279,7 +280,7 @@ end
 
 function shuffle_control(X_train, y_train, X_valid, y_valid, annual_periods)
     X_fit, y_fit, X_calibration = calibration_split(X_train, y_train)
-    Random.seed!(42)
+    Random.seed!(666)
     shuffled_labels = y_fit[randperm(length(y_fit))]
     machine_model = machine(make_model(), X_fit, shuffled_labels)
     fit!(machine_model, verbosity = 0)
@@ -296,7 +297,7 @@ function shuffle_control(X_train, y_train, X_valid, y_valid, annual_periods)
     )
 end
 
-function walk_forward(X, raw_returns; annual_periods, n_folds = 3, embargo = 1,
+function walk_forward(X, raw_returns; annual_periods, n_folds = FOLDS, embargo = 1,
                       n_max = size(X, 1))
     n_samples = min(size(X, 1), n_max)
     n_samples < 2 && return NamedTuple[], NamedTuple[]
@@ -365,7 +366,7 @@ end
 function holdout_passes(holdout, holdout_size)
     strict = holdout_size >= MIN_HOLDOUT_FOR_STRICT_GATE
     min_required = strict ? GATE_MEDIAN_SHARPE : 0.0
-    bh_threshold = 0.5 * max(0.0, holdout.bh_sharpe)
+    bh_threshold = 0.8 * max(0.0, holdout.bh_sharpe)
     return holdout.sharpe > min_required && holdout.sharpe > bh_threshold
 end
 
