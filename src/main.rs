@@ -14,16 +14,22 @@ use libm;
 
 const VOL_WINDOW: usize = 20;
 const FEATURE_WINDOW: usize = 5;
-const N_FEATS: usize = 11;
+const N_FEATS: usize = 8;
 const K_BARS: usize = 1;
 const MIN_SIGMA: f64 = 1e-8;
+const MIN_PREDICTION_STD: f64 = 1e-12;
 
-const MODEL_VERSION: &str = "2026-09-27/features-v2/close-close-scaled-v2/cost-return-v2/wf-v3";
+const MODEL_VERSION: &str =
+    "2026-10-02/features-v3-no-lags/raw-return-cost-loss/train-calibration-v2";
 
 #[derive(Deserialize, Debug)]
 struct Payload {
     status: String,
     equation: Option<String>,
+    #[serde(default)]
+    prediction_mean: Option<f64>,
+    #[serde(default)]
+    prediction_std: Option<f64>,
     n: usize,
     #[serde(default)]
     metrics: Option<Metrics>,
@@ -44,6 +50,10 @@ struct Checkpoint {
     history: Vec<f64>,
     status: String,
     equation: Option<String>,
+    #[serde(default)]
+    prediction_mean: Option<f64>,
+    #[serde(default)]
+    prediction_std: Option<f64>,
     #[serde(default)]
     rejection_reason: Option<String>,
     first_ts: i64,
@@ -66,7 +76,9 @@ struct Dataset {
     x: Vec<Vec<f64>>,
     target_scaled_return: Vec<f64>,
     target_scales: Vec<f64>,
+    target_timestamps: Vec<i64>,
     last_features: Vec<f64>,
+    last_features_ts: Option<i64>,
     first_ts: i64,
     last_ts: i64,
 }
@@ -78,31 +90,54 @@ fn all_finite(v: &[f64]) -> bool {
 }
 
 fn build_dataset(bars: &[Bar]) -> Dataset {
+    let mut ordered_bars = bars.to_vec();
+    ordered_bars.sort_by_key(|bar| bar.ts);
+    ordered_bars.dedup_by_key(|bar| bar.ts);
+
     let mut x = vec![];
     let mut target_scaled_return = vec![];
     let mut target_scales = vec![];
+    let mut target_timestamps = vec![];
     let mut prev_close = None;
     let mut volume_history = VecDeque::with_capacity(VOL_WINDOW);
     let mut feature_history = VecDeque::with_capacity(FEATURE_WINDOW);
 
     let mut pending: Option<(Vec<f64>, f64, f64)> = None;
     let mut last_features = vec![0.0; N_FEATS];
-    let (mut first_ts, mut last_ts) = (0, 0);
-    for bar in bars {
+    let mut last_features_ts = None;
+    let mut first_ts = 0;
+    let last_ts = ordered_bars.last().map(|bar| bar.ts).unwrap_or(0);
+    for bar in &ordered_bars {
         if ![bar.open, bar.high, bar.low, bar.close, bar.volume]
             .iter()
             .all(|v| v.is_finite())
             || !finite_positive(bar.open)
             || !finite_positive(bar.close)
             || bar.volume < 0.0
+            || bar.high < bar.open.max(bar.close)
+            || bar.low > bar.open.min(bar.close)
+            || bar.high < bar.low
         {
             pending = None;
+            prev_close = None;
+            volume_history.clear();
+            feature_history.clear();
             continue;
         }
         if first_ts == 0 {
             first_ts = bar.ts
         };
-        last_ts = bar.ts;
+        if let Some((past_features, past_close, past_sigma)) = pending.take() {
+            let target_return = (bar.close - past_close) / past_close;
+            let scaled = target_return / past_sigma;
+            if target_return.is_finite() && scaled.is_finite() {
+                x.push(past_features);
+                target_scaled_return.push(scaled);
+                target_scales.push(past_sigma);
+                target_timestamps.push(bar.ts);
+            }
+        }
+
         if let Some(pc) = prev_close {
             if finite_positive(pc) {
                 let vm = if volume_history.is_empty() {
@@ -130,34 +165,21 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
                             let sigma = (r.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
                                 / FEATURE_WINDOW as f64)
                                 .sqrt();
-                            let k = feature_history.len();
                             let mut features = base;
-                            features.extend_from_slice(&[
-                                feature_history[k - 2][0],
-                                feature_history[k - 3][0],
-                                feature_history[k - 5][0],
-                                mean,
-                                sigma,
-                            ]);
+                            features.extend_from_slice(&[mean, sigma]);
                             if all_finite(&features) && sigma >= MIN_SIGMA {
-                                if let Some((past_features, past_close, past_sigma)) =
-                                    pending.take()
-                                {
-                                    let target_return = (bar.close - past_close) / past_close;
-                                    let scaled = target_return / past_sigma;
-                                    if target_return.is_finite() && scaled.is_finite() {
-                                        x.push(past_features);
-                                        target_scaled_return.push(scaled);
-                                        target_scales.push(past_sigma);
-                                    }
-                                }
                                 last_features = features.clone();
+                                last_features_ts = Some(bar.ts);
                                 pending = Some((features, bar.close, sigma));
-                            } else {
-                                pending = None;
+                            } else if !all_finite(&features) {
+                                feature_history.clear();
                             }
                         }
+                    } else {
+                        feature_history.clear();
                     }
+                } else {
+                    feature_history.clear();
                 }
             }
         }
@@ -173,7 +195,9 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
         x,
         target_scaled_return,
         target_scales,
+        target_timestamps,
         last_features,
+        last_features_ts,
         first_ts,
         last_ts,
     }
@@ -185,11 +209,11 @@ async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
     let client = YfClient::default();
     let ticker = Ticker::new(&client, token);
     let history = ticker
-        .history(Some(Range::Y1), Some(Interval::I1h), false)
+        .history(Some(Range::M3), Some(Interval::I1h), false)
         .await?;
     let now = Utc::now();
 
-    let bars = history
+    let mut bars = history
         .into_iter()
         .filter_map(|c| {
             if c.ts + Duration::hours(1) > now {
@@ -208,16 +232,32 @@ async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
             })
         })
         .collect::<Vec<_>>();
+    bars.sort_by_key(|bar| bar.ts);
     debug!("Fetched {} bars for {}", bars.len(), token);
     let dataset = build_dataset(&bars);
     debug!("Built dataset with {} samples for {}", dataset.x.len(), token);
     Ok(dataset)
 }
 
-fn run(x: &[Vec<f64>], y: &[f64], scales: &[f64], path: &str) -> std::io::Result<String> {
+fn run(
+    x: &[Vec<f64>],
+    y: &[f64],
+    scales: &[f64],
+    timestamps: &[i64],
+    path: &str,
+) -> std::io::Result<String> {
     info!("Running Julia model with {} samples", x.len());
-    let body = serde_json::json!({"features":x,"target_scaled_return":y,"target_scales":scales,"k_bars":K_BARS});
-    debug!("Julia input: features={}, targets={}, scales={}", x.len(), y.len(), scales.len());
+    let body = serde_json::json!({
+        "features": x,
+        "target_scaled_return": y,
+        "target_scales": scales,
+        "target_timestamps": timestamps,
+        "k_bars": K_BARS
+    });
+    debug!(
+        "Julia input: features={}, targets={}, scales={}, timestamps={}",
+        x.len(), y.len(), scales.len(), timestamps.len()
+    );
     let mut child = Command::new(path)
         .arg("src/model.jl")
         .stdin(Stdio::piped())
@@ -245,6 +285,9 @@ fn checkpoint_is_valid(c: &Checkpoint, data: &Dataset) -> bool {
     c.model_version == MODEL_VERSION
         && c.status == "accepted"
         && c.equation.is_some()
+        && c.prediction_mean.is_some_and(f64::is_finite)
+        && c.prediction_std
+            .is_some_and(|v| v.is_finite() && v > MIN_PREDICTION_STD)
         && c.first_ts == data.first_ts
         && c.last_ts == data.last_ts
         && approx_eq(&c.history, &data.target_scaled_return)
@@ -308,6 +351,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             continue;
         }
+        if data.last_features_ts != Some(data.last_ts) {
+            warn!(
+                "{}: latest valid candle has no current feature vector; skipping prediction",
+                token
+            );
+            continue;
+        }
         fs::create_dir_all("checkpoints")?;
         let path = format!("checkpoints/{token}.json");
         let old: Option<Checkpoint> = fs::read_to_string(&path)
@@ -327,6 +377,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Payload {
                 status: c.status.clone(),
                 equation: c.equation.clone(),
+                prediction_mean: c.prediction_mean,
+                prediction_std: c.prediction_std,
                 n: c.sample_count,
                 metrics: c.metrics.clone(),
                 reason: None,
@@ -338,6 +390,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &data.x,
                 &data.target_scaled_return,
                 &data.target_scales,
+                &data.target_timestamps,
                 &julia,
             )?)?
         };
@@ -350,6 +403,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             history: data.target_scaled_return.clone(),
             status: payload.status.clone(),
             equation: payload.equation.clone(),
+            prediction_mean: payload.prediction_mean,
+            prediction_std: payload.prediction_std,
             rejection_reason: payload.reason.clone(),
             first_ts: data.first_ts,
             last_ts: data.last_ts,
@@ -368,12 +423,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .equation
             .as_deref()
             .ok_or("accepted model without equation")?;
+        let prediction_mean = payload
+            .prediction_mean
+            .filter(|v| v.is_finite())
+            .ok_or("accepted model without finite prediction mean")?;
+        let prediction_std = payload
+            .prediction_std
+            .filter(|v| v.is_finite() && *v > MIN_PREDICTION_STD)
+            .ok_or("accepted model without positive prediction standard deviation")?;
         debug!("Evaluating equation: {}", equation);
         let ctx = build_context(&data.last_features);
         match meval::eval_str_with_context(equation, &ctx) {
-            Ok(p) if p.is_finite() => {
-                info!("Prediction for {}: {}", token, p);
-                println!("predicted scaled close-to-close return for next candle of {token}: {p}")
+            Ok(prediction) if prediction.is_finite() => {
+                let position = ((prediction - prediction_mean) / prediction_std).tanh();
+                info!(
+                    "Prediction for {}: raw_return={}, position={}",
+                    token, prediction, position
+                );
+                println!(
+                    "predicted close-to-close return for next candle of {token}: {prediction}; position: {position}"
+                )
             }
             Ok(_) => warn!("Non-finite equation result for {}", token),
             Err(e) => error!("Evaluation error for {}: {}", token, e),
@@ -402,11 +471,36 @@ mod tests {
             .collect()
     }
     #[test]
-    fn features_targets_finite_lagged() {
+    fn features_targets_finite_without_lags() {
         let d = build_dataset(&bars());
         assert!(!d.x.is_empty());
         assert!(d.x.iter().all(|r| r.len() == N_FEATS && all_finite(r)));
         assert_eq!(d.x.len(), d.target_scales.len());
+        assert_eq!(d.x.len(), d.target_timestamps.len());
+    }
+    #[test]
+    fn invalid_candle_breaks_target_alignment() {
+        let mut b = bars();
+        b.extend((16..36).map(|i| {
+            let o = 100.0 + i as f64;
+            Bar {
+                ts: (i + 1) * 3600,
+                open: o,
+                high: o + 2.0,
+                low: o - 1.0,
+                close: o + 1.0 + (i % 2) as f64,
+                volume: 1000.0 + i as f64,
+            }
+        }));
+        b[18].close = f64::NAN;
+
+        let d = build_dataset(&b);
+        let skipped_candle_return = (b[19].close - b[17].close) / b[17].close;
+        assert!(!d
+            .target_scaled_return
+            .iter()
+            .zip(&d.target_scales)
+            .any(|(scaled, scale)| (scaled * scale - skipped_candle_return).abs() < 1e-12));
     }
     #[test]
     fn pending_sigma_normalizes_following_return() {
@@ -421,15 +515,32 @@ mod tests {
         b[6].close = f64::NAN;
         let d = build_dataset(&b);
         assert!(d.x.iter().flatten().all(|v| v.is_finite()));
+
+        let mut trailing_invalid = bars();
+        trailing_invalid.last_mut().unwrap().close = f64::NAN;
+        let d = build_dataset(&trailing_invalid);
+        assert_ne!(d.last_features_ts, Some(d.last_ts));
+    }
+    #[test]
+    fn input_bars_are_sorted_before_feature_alignment() {
+        let ordered = build_dataset(&bars());
+        let mut reversed = bars();
+        reversed.reverse();
+        let out_of_order = build_dataset(&reversed);
+        assert_eq!(ordered.target_timestamps, out_of_order.target_timestamps);
+        assert_eq!(ordered.target_scaled_return, out_of_order.target_scaled_return);
     }
     #[test]
     fn version_invalidates_checkpoint() {
         let data = build_dataset(&bars());
+        assert_eq!(data.x.len(), data.target_timestamps.len());
         let old = Checkpoint {
             model_version: "old".into(),
             history: data.target_scaled_return.clone(),
             status: "accepted".into(),
             equation: Some("x1".into()),
+            prediction_mean: Some(0.0),
+            prediction_std: Some(1.0),
             rejection_reason: None,
             first_ts: data.first_ts,
             last_ts: data.last_ts,
@@ -439,10 +550,30 @@ mod tests {
         assert!(!checkpoint_is_valid(&old, &data));
     }
     #[test]
+    fn checkpoint_requires_prediction_calibration() {
+        let data = build_dataset(&bars());
+        let checkpoint = Checkpoint {
+            model_version: MODEL_VERSION.into(),
+            history: data.target_scaled_return.clone(),
+            status: "accepted".into(),
+            equation: Some("x1".into()),
+            prediction_mean: Some(0.0),
+            prediction_std: None,
+            rejection_reason: None,
+            first_ts: data.first_ts,
+            last_ts: data.last_ts,
+            sample_count: data.x.len(),
+            metrics: None,
+        };
+        assert!(!checkpoint_is_valid(&checkpoint, &data));
+    }
+    #[test]
     fn rejected_models_have_no_equation() {
         let p = Payload {
             status: "rejected".into(),
             equation: None,
+            prediction_mean: None,
+            prediction_std: None,
             n: 0,
             metrics: None,
             reason: None,

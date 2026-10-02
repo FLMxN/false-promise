@@ -8,13 +8,28 @@ using LoopVectorization
 using Logging
 using SpecialFunctions: erf, erfc, gamma
 
-const logger = ConsoleLogger(stderr, Logging.Debug)
+struct WarningFilterLogger{L <: AbstractLogger} <: AbstractLogger
+    logger::L
+end
+
+Logging.min_enabled_level(logger::WarningFilterLogger) =
+    Logging.min_enabled_level(logger.logger)
+Logging.shouldlog(logger::WarningFilterLogger, level, _module, group, id) =
+    level != Logging.Warn &&
+    Logging.shouldlog(logger.logger, level, _module, group, id)
+Logging.catch_exceptions(logger::WarningFilterLogger) =
+    Logging.catch_exceptions(logger.logger)
+Logging.handle_message(logger::WarningFilterLogger, args...; kwargs...) =
+    Logging.handle_message(logger.logger, args...; kwargs...)
+
+const logger = WarningFilterLogger(ConsoleLogger(stderr, Logging.Debug))
 global_logger(logger)
 
-const PERIODS = 24 * 365 * 1
+const SECONDS_PER_YEAR = 365.2425 * 24 * 60 * 60
 
 const COST_RATE = 0.0005
-const MIN_TRAIN_SAMPLES = 30
+const MIN_PREDICTION_STD = 1e-12
+const MIN_TRAIN_SAMPLES = 15
 
 const GATE_MEDIAN_SHARPE = 0.3
 const GATE_POSITIVE_FOLDS = 0.5
@@ -26,7 +41,7 @@ const GATE_BEATS_BUY_HOLD = 0.4
 const MIN_FOLDS_FOR_ACCEPT = 2
 const MIN_HOLDOUT_FOR_STRICT_GATE = 40
 
-const BUDGET = 300
+const BUDGET = 250
 
 safe_div(a, b) = a / (abs(b) + 1e-4)
 safe_sqrt(x) = sqrt(abs(x))
@@ -87,61 +102,86 @@ function rows_to_matrix(rows)
     return X
 end
 
-function sharpe_ratio(returns; periods = PERIODS)
+function periods_per_year(timestamps)
+    length(timestamps) >= 2 || throw(ArgumentError("at least two timestamps are required"))
+    elapsed_seconds = timestamps[end] - timestamps[1]
+    elapsed_seconds > 0 || throw(ArgumentError("timestamps must be strictly increasing"))
+    return (length(timestamps) - 1) * SECONDS_PER_YEAR / elapsed_seconds
+end
+
+function sharpe_ratio(returns, annual_periods)
     length(returns) < 2 && return 0.0
     return_std = std(returns)
     (!isfinite(return_std) || return_std <= 1e-12) && return 0.0
-    return finite_or_zero(mean(returns) / return_std * sqrt(periods))
+    return finite_or_zero(mean(returns) / return_std * sqrt(annual_periods))
 end
 
-function sortino_ratio(returns; periods = PERIODS)
-    downside_returns = returns[returns .< 0]
-    length(downside_returns) < 2 && return 0.0
-    downside_std = std(downside_returns)
-    downside_std <= 1e-12 && return 0.0
-    return finite_or_zero(mean(returns) / downside_std * sqrt(periods))
+function sortino_ratio(returns, annual_periods)
+    downside_deviation = sqrt(mean(min(r, 0.0)^2 for r in returns))
+    downside_deviation <= 1e-12 && return 0.0
+    return finite_or_zero(mean(returns) / downside_deviation * sqrt(annual_periods))
+end
+
+function hac_t_stat(returns)
+    n = length(returns)
+    n < 2 && return 0.0
+    centered = returns .- mean(returns)
+    bandwidth = min(n - 1, floor(Int, 4 * (n / 100)^(2 / 9)))
+    long_run_variance = sum(abs2, centered) / n
+    for lag in 1:bandwidth
+        covariance = sum(centered[(lag + 1):n] .* centered[1:(n - lag)]) / n
+        bartlett_weight = 1 - lag / (bandwidth + 1)
+        long_run_variance += 2 * bartlett_weight * covariance
+    end
+    (!isfinite(long_run_variance) || long_run_variance <= 1e-24) && return 0.0
+    return finite_or_zero(mean(returns) / sqrt(long_run_variance / n))
 end
 
 
-function backtest_metrics(y_scaled, prediction_scaled, scales; cost_rate = COST_RATE)
-    n = length(y_scaled)
+function prediction_positions(prediction, calibration_mean, calibration_std)
+    if !isfinite(calibration_mean) || !isfinite(calibration_std) ||
+       calibration_std <= MIN_PREDICTION_STD
+        return zeros(length(prediction))
+    end
+    return tanh.((prediction .- calibration_mean) ./ calibration_std)
+end
+
+function strategy_returns(raw_returns, positions; cost_rate = COST_RATE)
+    traded_notional = abs.([positions[1]; diff(positions)])
+    net_returns = positions .* raw_returns .- cost_rate .* traded_notional
+    return net_returns, traded_notional
+end
+
+function max_drawdown(returns)
+    equity_curve = cumprod(1 .+ returns)
+    running_peaks = accumulate(max, [1.0; equity_curve])[2:end]
+    return minimum(equity_curve ./ running_peaks .- 1)
+end
+
+function backtest_metrics(raw_returns, prediction, calibration_mean, calibration_std;
+                          annual_periods, cost_rate = COST_RATE)
+    n = length(raw_returns)
     valid_input = n >= 2 &&
-                  length(prediction_scaled) == n &&
-                  length(scales) == n &&
-                  all(isfinite, y_scaled) &&
-                  all(isfinite, prediction_scaled) &&
-                  all(scale -> isfinite(scale) && scale > 0, scales)
+                  length(prediction) == n &&
+                  all(isfinite, raw_returns) &&
+                  all(isfinite, prediction) &&
+                  isfinite(calibration_mean) &&
+                  isfinite(calibration_std) &&
+                  calibration_std > 0
     !valid_input && return empty_metrics()
 
-    raw_returns = y_scaled .* scales
-
-    prediction_std = std(prediction_scaled)
-    positions = if prediction_std <= 1e-12
-        zeros(n)
-    else
-        prediction_zscore = (prediction_scaled .- mean(prediction_scaled)) ./ prediction_std
-        tanh.(prediction_zscore)
-    end
-
-    gross_returns = positions .* raw_returns
-    traded_notional = abs.([positions[1]; diff(positions)])
-    transaction_costs = cost_rate .* traded_notional
-    net_returns = gross_returns .- transaction_costs
-
-    equity_curve = cumsum(net_returns)
-    drawdown = minimum(equity_curve .- accumulate(max, equity_curve))
-    net_std = std(net_returns)
-    t_stat = net_std <= 1e-12 ? 0.0 : mean(net_returns) / net_std * sqrt(n)
+    positions = prediction_positions(prediction, calibration_mean, calibration_std)
+    net_returns, traded_notional = strategy_returns(raw_returns, positions; cost_rate)
 
     return (
-        sharpe = sharpe_ratio(net_returns),
-        sortino = sortino_ratio(net_returns),
-        max_drawdown = finite_or_zero(drawdown),
+        sharpe = sharpe_ratio(net_returns, annual_periods),
+        sortino = sortino_ratio(net_returns, annual_periods),
+        max_drawdown = finite_or_zero(max_drawdown(net_returns)),
         turnover = finite_or_zero(sum(traded_notional)),
-        total_return = finite_or_zero(sum(net_returns)),
-        t_stat = finite_or_zero(t_stat),
-        std_pred = finite_or_zero(prediction_std),
-        bh_sharpe = sharpe_ratio(raw_returns),
+        total_return = finite_or_zero(prod(1 .+ net_returns) - 1),
+        t_stat = hac_t_stat(net_returns),
+        std_pred = finite_or_zero(std(prediction)),
+        bh_sharpe = sharpe_ratio(raw_returns, annual_periods),
     )
 end
 
@@ -151,12 +191,14 @@ function training_loss(tree, dataset, options)
               length(prediction) < 2 || std(prediction) <= 1e-12
     invalid && return Inf
 
-    signal = tanh.((prediction .- mean(prediction)) ./ std(prediction))
-    normalized_pnl = signal .* dataset.y
-    return std(normalized_pnl) <= 1e-12 ? Inf : exp(-mean(normalized_pnl) / std(normalized_pnl))
+    positions = prediction_positions(prediction, mean(prediction), std(prediction))
+    net_returns, _ = strategy_returns(dataset.y, positions)
+    net_std = std(net_returns)
+    return !isfinite(net_std) || net_std <= 1e-12 ?
+           Inf : exp(-mean(net_returns) / net_std)
 end
 
-function make_model(y_train; parsimony_multiplier = 0.016)
+function make_model(; parsimony_multiplier = 0.0)
     return SRRegressor(
         niterations = BUDGET,
         populations = BUDGET ÷ 10,
@@ -190,12 +232,12 @@ function make_model(y_train; parsimony_multiplier = 0.016)
         safe_asin => 1, safe_acos => 1, safe_acosh => 1, safe_atanh => 1,
         erf => 2, erfc => 2, safe_gamma => 2,
         ),
-        maxsize = 6,
-        maxdepth = 3,
-        parsimony = parsimony_multiplier * max(std(y_train)^2, 1e-12),
+        maxsize = 10,
+        maxdepth = 5,
+        parsimony = parsimony_multiplier,
         loss_function = training_loss,
         elementwise_loss = nothing,
-        batching = true,
+        batching = false,
         turbo = false,
         nested_constraints = [
         safe_log  => [safe_log => 0, safe_log2 => 0, safe_log10 => 0, safe_log1p => 0],
@@ -205,29 +247,57 @@ function make_model(y_train; parsimony_multiplier = 0.016)
     )
 end
 
-function fit_and_evaluate(X_train, y_train, X_valid, y_valid, valid_scales)
-    machine_model = machine(make_model(y_train;), X_train, y_train)
+function calibration_split(X, y)
+    n = size(X, 1)
+    length(y) == n || throw(ArgumentError("feature and target lengths differ"))
+    calibration_size = max(2, round(Int, 0.2 * n))
+    fit_end = n - calibration_size
+    fit_end >= MIN_TRAIN_SAMPLES ||
+        throw(ArgumentError("not enough training samples after calibration split"))
+    return X[1:fit_end, :], y[1:fit_end], X[(fit_end + 1):end, :]
+end
+
+function fit_and_evaluate(X_train, y_train, X_valid, y_valid, annual_periods)
+    X_fit, y_fit, X_calibration = calibration_split(X_train, y_train)
+    machine_model = machine(make_model(), X_fit, y_fit)
     fit!(machine_model, verbosity = 0)
 
     report_data = report(machine_model)
-    equation = string(report_data.equations[report_data.best_idx])
-    validation_prediction = predict(machine_model, (data = X_valid, idx = report_data.best_idx))
+    best_idx = report_data.best_idx
+    equation = string(report_data.equations[best_idx])
+    calibration_prediction = predict(machine_model, (data = X_calibration, idx = best_idx))
+    calibration_mean = mean(calibration_prediction)
+    calibration_std = std(calibration_prediction)
+    validation_prediction = predict(machine_model, (data = X_valid, idx = best_idx))
 
-    return equation, backtest_metrics(y_valid, validation_prediction, valid_scales)
+    metrics = backtest_metrics(
+        y_valid, validation_prediction, calibration_mean, calibration_std;
+        annual_periods,
+    )
+    return equation, metrics, calibration_mean, calibration_std
 end
 
-function shuffle_control(X_train, y_train, X_valid, y_valid, valid_scales;)
+function shuffle_control(X_train, y_train, X_valid, y_valid, annual_periods)
+    X_fit, y_fit, X_calibration = calibration_split(X_train, y_train)
     Random.seed!(42)
-    shuffled_labels = y_train[randperm(length(y_train))]
-    machine_model = machine(make_model(shuffled_labels;), X_train, shuffled_labels)
+    shuffled_labels = y_fit[randperm(length(y_fit))]
+    machine_model = machine(make_model(), X_fit, shuffled_labels)
     fit!(machine_model, verbosity = 0)
 
     report_data = report(machine_model)
-    validation_prediction = predict(machine_model, (data = X_valid, idx = report_data.best_idx))
-    return backtest_metrics(y_valid, validation_prediction, valid_scales)
+    best_idx = report_data.best_idx
+    calibration_prediction = predict(machine_model, (data = X_calibration, idx = best_idx))
+    calibration_mean = mean(calibration_prediction)
+    calibration_std = std(calibration_prediction)
+    validation_prediction = predict(machine_model, (data = X_valid, idx = best_idx))
+    return backtest_metrics(
+        y_valid, validation_prediction, calibration_mean, calibration_std;
+        annual_periods,
+    )
 end
 
-function walk_forward(X, y, scales; n_folds = 3, embargo = 1, n_max = size(X, 1))
+function walk_forward(X, raw_returns; annual_periods, n_folds = 3, embargo = 1,
+                      n_max = size(X, 1))
     n_samples = min(size(X, 1), n_max)
     n_samples < 2 && return NamedTuple[], NamedTuple[]
 
@@ -241,22 +311,26 @@ function walk_forward(X, y, scales; n_folds = 3, embargo = 1, n_max = size(X, 1)
         validation_start = train_end + embargo + 1
         validation_end = min(validation_start + fold_size - 1, n_samples)
 
-        if train_end < MIN_TRAIN_SAMPLES || validation_start > validation_end
+        min_train_for_calibration = MIN_TRAIN_SAMPLES + max(2, round(Int, 0.2 * train_end))
+        if train_end < min_train_for_calibration || validation_start > validation_end
             @debug "Skipping fold $(fold): insufficient samples (train_end=$(train_end), val=$(validation_start):$(validation_end))"
             continue
         end
         @debug "Processing fold $(fold): train=1:$(train_end), validation=$(validation_start):$(validation_end)"
 
         X_train = X[1:train_end, :]
-        y_train = y[1:train_end]
+        y_train = raw_returns[1:train_end]
         X_valid = X[validation_start:validation_end, :]
-        y_valid = y[validation_start:validation_end]
-        valid_scales = scales[validation_start:validation_end]
+        y_valid = raw_returns[validation_start:validation_end]
 
-        equation, metrics = fit_and_evaluate(X_train, y_train, X_valid, y_valid, valid_scales;)
-        shuffled = shuffle_control(X_train, y_train, X_valid, y_valid, valid_scales;)
+        equation, metrics, _, _ =
+            fit_and_evaluate(X_train, y_train, X_valid, y_valid, annual_periods)
+        shuffled = shuffle_control(X_train, y_train, X_valid, y_valid, annual_periods)
 
-        @info "Fold $(fold) complete: train=1:$(train_end), validation=$(validation_start):$(validation_end), equation=$(equation)"
+        @info "Fold $(fold) complete: train=1:$(train_end), validation=$(validation_start):$(validation_end), " *
+              "strategy_sharpe=$(round(metrics.sharpe, digits=3)), " *
+              "buy_hold_sharpe=$(round(metrics.bh_sharpe, digits=3)), " *
+              "turnover=$(round(metrics.turnover, digits=3)), equation=$(equation)"
         push!(fold_metrics, metrics)
         push!(shuffle_metrics, shuffled)
     end
@@ -295,8 +369,9 @@ function holdout_passes(holdout, holdout_size)
     return holdout.sharpe > min_required && holdout.sharpe > bh_threshold
 end
 
-function discover(X, y, scales; k_bars = 1)
+function discover(X, raw_returns, timestamps; k_bars = 1)
     n_total = size(X, 1)
+    annual_periods = periods_per_year(timestamps)
 
     if n_total - MIN_TRAIN_SAMPLES < 5
         @warn "Not enough samples beyond MIN_TRAIN_SAMPLES=$(MIN_TRAIN_SAMPLES): n=$(n_total)"
@@ -320,7 +395,8 @@ function discover(X, y, scales; k_bars = 1)
 
     @info "Starting walk-forward validation (n_max=$(final_train_end))"
     metrics, shuffled_metrics = walk_forward(
-        X, y, scales;
+        X, raw_returns;
+        annual_periods,
         embargo = k_bars,
         n_max = final_train_end,
     )
@@ -357,12 +433,13 @@ function discover(X, y, scales; k_bars = 1)
     end
 
     @info "Running final holdout evaluation on $(effective_holdout_size) samples"
-    equation, holdout = fit_and_evaluate(
-        X[1:final_train_end, :], y[1:final_train_end],
-        X[holdout_start:holdout_end, :], y[holdout_start:holdout_end],
-        scales[holdout_start:holdout_end];
+    equation, holdout, prediction_mean, prediction_std = fit_and_evaluate(
+        X[1:final_train_end, :], raw_returns[1:final_train_end],
+        X[holdout_start:holdout_end, :], raw_returns[holdout_start:holdout_end],
+        annual_periods,
     )
 
+    @info "Annualization: $(round(annual_periods, digits=1)) observed candles/year"
     @info "Holdout metrics: sharpe=$(round(holdout.sharpe, digits=3)), " *
           "bh_sharpe=$(round(holdout.bh_sharpe, digits=3)), " *
           "sortino=$(round(holdout.sortino, digits=3)), " *
@@ -380,6 +457,8 @@ function discover(X, y, scales; k_bars = 1)
     return (
         status = "accepted",
         equation = equation,
+        prediction_mean = prediction_mean,
+        prediction_std = prediction_std,
         n = n_total,
         metrics = (
             sharpe = finite_or_zero(holdout.sharpe),
@@ -392,11 +471,17 @@ function discover(X, y, scales; k_bars = 1)
     )
 end
 
-function valid_input(rows, y, scales)
-    return length(rows) >= MIN_TRAIN_SAMPLES &&
+function valid_input(rows, y, scales, timestamps)
+    n = length(rows)
+    return n >= MIN_TRAIN_SAMPLES &&
+           length(y) == n &&
+           length(scales) == n &&
+           length(timestamps) == n &&
            all(isfinite, y) &&
            all(scale -> isfinite(scale) && scale > 0, scales) &&
-           all(row -> length(row) == 11 && all(isfinite, row), rows)
+           all(isfinite, y .* scales) &&
+           all(row -> length(row) == 8 && all(isfinite, row), rows) &&
+           all(diff(timestamps) .> 0)
 end
 
 function main(io = stdin)
@@ -407,17 +492,18 @@ function main(io = stdin)
     rows = [Float64.(collect(row)) for row in payload.features]
     y = Float64.(payload.target_scaled_return)
     scales = Float64.(payload.target_scales)
+    timestamps = Int64.(get(payload, :target_timestamps, Int64[]))
 
-    n = min(length(rows), length(y), length(scales))
-    rows, y, scales = rows[1:n], y[1:n], scales[1:n]
-    @info "Processing $(n) samples"
+    @info "Processing $(length(rows)) samples"
 
-    if !valid_input(rows, y, scales)
-        @warn "Input validation failed (need >= $(MIN_TRAIN_SAMPLES) valid samples)"
+    if !valid_input(rows, y, scales, timestamps)
+        @warn "Input validation failed (misaligned or invalid feature, target, scale, or timestamp data)"
         JSON3.write(stdout, rejected("invalid or insufficient feature/target data"))
     else
         @info "Input validated, starting discovery"
-        result = discover(rows_to_matrix(rows), y, scales; k_bars = Int(get(payload, :k_bars, 1)))
+        raw_returns = y .* scales
+        result = discover(rows_to_matrix(rows), raw_returns, timestamps;
+                          k_bars = Int(get(payload, :k_bars, 1)))
         @info "Discovery complete, status: $(result.status)"
         JSON3.write(stdout, result)
     end
@@ -427,14 +513,37 @@ function main(io = stdin)
 end
 
 function selftest()
-    y_scaled = [1.0, -1.0]
-    prediction_scaled = [1.0, -1.0]
-    scales = [0.01, 0.01]
-
-    metrics = backtest_metrics(y_scaled, prediction_scaled, scales; cost_rate = 0.001)
-    @assert metrics.total_return < 0.02
-    @assert backtest_metrics(y_scaled, [1.0, 1.0], scales).turnover == 0.0
-    @assert discover(zeros(2, 11), [0.0, 0.0], [1.0, 1.0]).status == "rejected"
+    @assert !Logging.shouldlog(logger, Logging.Warn, @__MODULE__, :test, :warning)
+    @assert Logging.shouldlog(logger, Logging.Info, @__MODULE__, :test, :info)
+    raw_returns = [0.01, -0.01]
+    prediction = [1.0, -1.0]
+    annual_periods = periods_per_year([0, 3600, 7200])
+    @assert isapprox(annual_periods, SECONDS_PER_YEAR / 3600)
+    metrics = backtest_metrics(
+        raw_returns, prediction, 0.0, 1.0;
+        annual_periods, cost_rate = 0.001,
+    )
+    positions = prediction_positions(prediction, 0.0, 1.0)
+    net_returns, _ = strategy_returns(raw_returns, positions; cost_rate = 0.001)
+    @assert isapprox(metrics.total_return, prod(1 .+ net_returns) - 1)
+    @assert backtest_metrics(
+        raw_returns, [0.0, 0.0], 0.0, 1.0; annual_periods,
+    ).turnover == 0.0
+    @assert prediction_positions([1.0, 3.0], 1.0, 2.0) ≈ tanh.([0.0, 1.0])
+    net_returns, traded_notional = strategy_returns(raw_returns, [1.0, -1.0]; cost_rate = 0.001)
+    @assert net_returns ≈ [0.009, 0.008]
+    @assert sum(traded_notional) == 3.0
+    @assert isapprox(max_drawdown([0.1, -0.2, 0.1]), -0.2)
+    @assert sortino_ratio([0.1, -0.1], annual_periods) == 0.0
+    @assert sortino_ratio([0.2, -0.05, -0.05], annual_periods) > 0
+    @assert hac_t_stat(ones(4)) == 0.0
+    @assert isfinite(hac_t_stat([0.01, -0.02, 0.03, -0.01, 0.02]))
+    @assert !valid_input([[0.0 for _ in 1:8]], [0.0, 0.0], [1.0], [1])
+    @assert discover(zeros(2, 8), [0.0, 0.0], [1, 2]).status == "rejected"
+    X_fit, y_fit, X_calibration =
+        calibration_split(reshape(Float64.(1:100), :, 1), Float64.(1:100))
+    @assert size(X_fit, 1) == length(y_fit) == 80
+    @assert X_fit[end, 1] < X_calibration[1, 1]
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
