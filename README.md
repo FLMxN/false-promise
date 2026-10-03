@@ -1,6 +1,6 @@
 # False Promise
 
-Experimental Rust + Julia symbolic-regression research project for hourly Yahoo Finance data. It is not production trading software.
+Experimental Rust + Julia symbolic-regression research project for hourly Yahoo Finance data. It is not production trading software (yet).
 
 ## Data contract and timing
 
