@@ -20,7 +20,7 @@ const MIN_SIGMA: f64 = 1e-8;
 const MIN_PREDICTION_STD: f64 = 1e-12;
 
 const MODEL_VERSION: &str =
-    "2026-10-02/features-v3-no-lags/raw-return-cost-loss/train-calibration-v2";
+    "2026-10-03/features-v3-no-lags/raw-return-cost-loss/robust-validation-v1";
 
 #[derive(Deserialize, Debug)]
 struct Payload {
@@ -34,12 +34,14 @@ struct Payload {
     #[serde(default)]
     metrics: Option<Metrics>,
     #[serde(default)]
+    validation: Option<serde_json::Value>,
+    #[serde(default)]
     reason: Option<String>,
 }
 #[derive(Deserialize, Debug, Serialize, Clone)]
 struct Metrics {
     sharpe: f64,
-    sortino: f64,
+    sortino: Option<f64>,
     max_drawdown: f64,
     turnover: f64,
     total_return: f64,
@@ -61,6 +63,8 @@ struct Checkpoint {
     sample_count: usize,
     #[serde(default)]
     metrics: Option<Metrics>,
+    #[serde(default)]
+    validation: Option<serde_json::Value>,
 }
 #[derive(Clone, Debug)]
 struct Bar {
@@ -384,6 +388,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 prediction_std: c.prediction_std,
                 n: c.sample_count,
                 metrics: c.metrics.clone(),
+                validation: c.validation.clone(),
                 reason: None,
             }
         } else {
@@ -413,6 +418,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_ts: data.last_ts,
             sample_count: data.x.len(),
             metrics: payload.metrics.clone(),
+            validation: payload.validation.clone(),
         };
         debug!("Saving checkpoint to {}", path);
         let mut out = BufWriter::new(fs::File::create(&path)?);
@@ -561,6 +567,7 @@ mod tests {
             last_ts: data.last_ts,
             sample_count: data.x.len(),
             metrics: None,
+            validation: None,
         };
         assert!(!checkpoint_is_valid(&old, &data));
     }
@@ -579,8 +586,33 @@ mod tests {
             last_ts: data.last_ts,
             sample_count: data.x.len(),
             metrics: None,
+            validation: None,
         };
         assert!(!checkpoint_is_valid(&checkpoint, &data));
+    }
+    #[test]
+    fn legacy_checkpoint_without_validation_is_readable() {
+        let old = serde_json::json!({
+            "model_version": MODEL_VERSION,
+            "history": [0.0],
+            "status": "accepted",
+            "equation": "x1",
+            "prediction_mean": 0.0,
+            "prediction_std": 1.0,
+            "first_ts": 1,
+            "last_ts": 2,
+            "sample_count": 1,
+            "metrics": {
+                "sharpe": 1.0,
+                "sortino": 1.25,
+                "max_drawdown": -0.1,
+                "turnover": 0.5,
+                "total_return": 0.2
+            }
+        });
+        let checkpoint: Checkpoint = serde_json::from_value(old).unwrap();
+        assert!(checkpoint.validation.is_none());
+        assert_eq!(checkpoint.metrics.unwrap().sortino, Some(1.25));
     }
     #[test]
     fn rejected_models_have_no_equation() {
@@ -591,6 +623,7 @@ mod tests {
             prediction_std: None,
             n: 0,
             metrics: None,
+            validation: None,
             reason: None,
         };
         assert!(p.status != "accepted" && p.equation.is_none());
