@@ -288,7 +288,7 @@ async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
     let client = YfClient::default();
     let ticker = Ticker::new(&client, token);
     let history = ticker
-        .history(Some(Range::Y1), Some(Interval::I1h), false)
+        .history(Some(Range::Y2), Some(Interval::I1h), false)
         .await?;
     let now = Utc::now();
 
