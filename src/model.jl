@@ -6,7 +6,6 @@ using Random
 using SymbolicRegression: eval_tree_array
 using LoopVectorization
 using Logging
-using SpecialFunctions: erf, erfc, gamma
 
 struct WarningFilterLogger{L <: AbstractLogger} <: AbstractLogger
     logger::L
@@ -25,46 +24,19 @@ Logging.handle_message(logger::WarningFilterLogger, args...; kwargs...) =
 const logger = WarningFilterLogger(ConsoleLogger(stderr, Logging.Debug))
 global_logger(logger)
 
-const SECONDS_PER_YEAR = 365.2425 * 24 * 60 * 60
-const BUDGET = 180
+const BUDGET = 300
+const POPULATIONS = 30
+const POPULATION_SIZE = 27
 const FOLDS = 9
 
 const COST_RATE = 0.0005
 const MIN_PREDICTION_STD = 1e-12
 const MIN_TRAIN_SAMPLES = 15
-
-safe_div(a, b) = a / (abs(b) + 1e-4)
-safe_sqrt(x) = sqrt(abs(x))
-safe_log(x) = log(abs(x) + 1e-9)
-safe_log2(x) = log2(abs(x) + 1e-9)
-safe_log10(x) = log10(abs(x) + 1e-9)
-safe_log1p(x) = log1p(abs(x) + 1e-9)
+const MAX_AVG_TURNOVER = 0.5
+const BOOTSTRAP_REPLICATES = 1000
 
 square(x) = x * x
-cube(x) = x * x * x
 relu(x) = x > 0.0 ? x : 0.0
-function safe_pow(a, b)
-    (a < 0 && b != round(b)) && return 0.0
-    r = a^b
-    return isfinite(r) ? clamp(r, -1e6, 1e6) : 0.0
-end
-greater(a, b) = a > b ? 1.0 : 0.0
-logical_or(a, b) = (a != 0.0 || b != 0.0) ? 1.0 : 0.0
-logical_and(a, b) = (a != 0.0 && b != 0.0) ? 1.0 : 0.0
-
-safe_asin(x)  = abs(x) <= 1 ? asin(x)  : NaN
-safe_acos(x)  = abs(x) <= 1 ? acos(x)  : NaN
-safe_acosh(x) = x >= 1      ? acosh(x) : NaN
-safe_atanh(x) = abs(x) < 1  ? atanh(x) : NaN
-
-function safe_gamma(x)
-    try
-        r = gamma(x)
-        return isfinite(r) ? r : NaN
-    catch
-        return NaN
-    end
-end
 
 function rows_to_matrix(rows)
     isempty(rows) && return zeros(0, 0)
@@ -77,12 +49,7 @@ function rows_to_matrix(rows)
     return X
 end
 
-function periods_per_year(timestamps)
-    length(timestamps) >= 2 || throw(ArgumentError("at least two timestamps are required"))
-    elapsed_seconds = timestamps[end] - timestamps[1]
-    elapsed_seconds > 0 || throw(ArgumentError("timestamps must be strictly increasing"))
-    return (length(timestamps) - 1) * SECONDS_PER_YEAR / elapsed_seconds
-end
+periods_per_year(is_crypto) = is_crypto ? 365 * 6 : 252 * 2
 
 function invalid_metrics(sample_count, reason)
     return (
@@ -101,6 +68,7 @@ function invalid_metrics(sample_count, reason)
         max_drawdown = nothing,
         turnover = nothing,
         t_stat = nothing,
+        bootstrap_mean_lower = nothing,
         std_pred = nothing,
     )
 end
@@ -174,6 +142,7 @@ function backtest_metrics(raw_returns, prediction, calibration_mean, calibration
 
     positions = prediction_positions(prediction, calibration_mean, calibration_std)
     net_returns, traded_notional = strategy_returns(raw_returns, positions; cost_rate)
+    bootstrap_lower = bootstrap_mean_lower(net_returns)
     strategy_sharpe = sharpe_ratio(net_returns, annual_periods)
     buy_hold_sharpe = sharpe_ratio(raw_returns, annual_periods)
     (strategy_sharpe === nothing || buy_hold_sharpe === nothing) &&
@@ -187,7 +156,8 @@ function backtest_metrics(raw_returns, prediction, calibration_mean, calibration
     prediction_std = std(prediction; corrected = true)
     required_values = (strategy_sharpe, buy_hold_sharpe, strategy_total_return,
                        buy_hold_total_return, strategy_vs_bh_return,
-                       strategy_vs_bh_sharpe, turnover, drawdown, prediction_std)
+                       strategy_vs_bh_sharpe, turnover, drawdown, prediction_std,
+                       bootstrap_lower)
     all(value -> value !== nothing && isfinite(value), required_values) ||
         return invalid_metrics(n, "non-finite return, turnover, or undefined Sharpe")
 
@@ -207,12 +177,17 @@ function backtest_metrics(raw_returns, prediction, calibration_mean, calibration
         max_drawdown = drawdown,
         turnover = turnover,
         t_stat = hac_t_stat(net_returns),
+        bootstrap_mean_lower = bootstrap_lower,
         std_pred = prediction_std,
     )
 end
 
 function training_loss(tree, dataset, options)
-    prediction, completed = eval_tree_array(tree, dataset.X, options)
+    prediction, completed = try
+        eval_tree_array(tree, dataset.X, options)
+    catch
+        return Inf
+    end
     invalid = !completed || !all(isfinite, prediction) ||
               length(prediction) < 2 || std(prediction) <= 1e-12
     invalid && return Inf
@@ -220,102 +195,132 @@ function training_loss(tree, dataset, options)
     positions = prediction_positions(prediction, mean(prediction), std(prediction))
     net_returns, _ = strategy_returns(dataset.y, positions)
     net_std = std(net_returns)
-    return !isfinite(net_std) || net_std <= 1e-12 ?
-           Inf : exp(-mean(net_returns) / net_std)
+    (!isfinite(net_std) || net_std <= 1e-12) && return Inf
+    sharpe = mean(net_returns) / net_std
+    return bounded_sharpe_loss(sharpe)
 end
 
-function make_model(; parsimony_multiplier = 0.0016)
+bounded_sharpe_loss(sharpe) = isfinite(sharpe) ? -clamp(sharpe, -10.0, 10.0) : Inf
+
+function bootstrap_mean_lower(returns; replicates = BOOTSTRAP_REPLICATES)
+    n = length(returns)
+    n >= 2 && all(isfinite, returns) || return nothing
+    rng = MersenneTwister(20261003)
+    block_size = max(1, round(Int, n^(1 / 3)))
+    bootstrap_means = Vector{Float64}(undef, replicates)
+    for replicate in 1:replicates
+        sample = Float64[]
+        while length(sample) < n
+            start_index = rand(rng, 1:n)
+            for offset in 0:(block_size - 1)
+                push!(sample, returns[mod1(start_index + offset, n)])
+                length(sample) == n && break
+            end
+        end
+        bootstrap_means[replicate] = mean(sample)
+    end
+    return quantile(bootstrap_means, 0.025)
+end
+
+function make_model(; parsimony_multiplier = 0.02)
     return SRRegressor(
         niterations = BUDGET,
-        populations = BUDGET ÷ 10,
-        population_size = BUDGET ÷ 10,
-        ncycles_per_iteration = BUDGET ÷ 10,
+        populations = POPULATIONS,
+        population_size = POPULATION_SIZE,
+        ncycles_per_iteration = 50,
         binary_operators = [
-        +, -, *, safe_div,
-        safe_pow,
-        # greater, logical_or, logical_and
+        +, -, *, /,
     ],
     unary_operators = [
-        abs, safe_sqrt, safe_log,
-        safe_log2, safe_log10, safe_log1p,
-        square, cube, relu,
-        exp, sin, cos, tan,
-        sinh, cosh, tanh, asinh,
-        safe_asin, safe_acos, safe_acosh, safe_atanh,
-        erf, erfc, safe_gamma,                          
+        sqrt, square, tanh, relu,
     ],
     complexity_of_operators = Dict(
-        (+) => 1, (-) => 1, (*) => 1,
-        safe_div => 2, safe_pow => 2,
-        # greater => 1, logical_or => 1, logical_and => 1,
-
-        abs => 1, safe_sqrt => 2, safe_log => 2,
-        safe_log2 => 2, safe_log10 => 2, safe_log1p => 2,
-        square => 1, cube => 1, relu => 1,
-
-        exp => 1, sin => 1, cos => 1, tan => 1,
-        sinh => 1, cosh => 1, tanh => 1,
-        safe_asin => 1, safe_acos => 1, safe_acosh => 1, safe_atanh => 1,
-        erf => 2, erfc => 2, safe_gamma => 2,
+        (+) => 1, (-) => 1, (*) => 1, (/) => 1,
+        sqrt => 1, square => 1, tanh => 1, relu => 1,
         ),
-        maxsize = 20,
-        maxdepth = 10,
+        maxsize = 12,
+        maxdepth = 6,
         parsimony = parsimony_multiplier,
         loss_function = training_loss,
+        loss_scale = :linear,
         elementwise_loss = nothing,
         batching = false,
         turbo = false,
-        nested_constraints = [
-        safe_log  => [safe_log => 0, safe_log2 => 0, safe_log10 => 0, safe_log1p => 0],
-        safe_sqrt => [safe_sqrt => 1],
-        exp       => [exp => 0, safe_log => 0, safe_log2 => 0, safe_log10 => 0, safe_log1p => 0],
-        ]
     )
 end
 
-function calibration_split(X, y)
+function feature_scaling(X)
+    means = vec(mean(X; dims = 1))
+    scales = vec(std(X; dims = 1, corrected = false))
+    scales .= ifelse.(isfinite.(scales) .& (scales .> 1e-12), scales, 1.0)
+    return means, scales
+end
+
+standardize_features(X, means, scales) = (X .- reshape(means, 1, :)) ./ reshape(scales, 1, :)
+
+function fit_best_model(X_fit, y_fit)
+    means, scales = feature_scaling(X_fit)
+    X_normalized = standardize_features(X_fit, means, scales)
+    machine_model = machine(make_model(), X_normalized, y_fit)
+    fit!(machine_model, verbosity = 0)
+    report_data = report(machine_model)
+    best_idx = report_data.best_idx
+    return machine_model, best_idx, means, scales
+end
+
+function oos_calibration_predictions(X, y; shuffle_targets = false)
     n = size(X, 1)
     length(y) == n || throw(ArgumentError("feature and target lengths differ"))
-    calibration_size = max(2, round(Int, 0.2 * n))
-    fit_end = n - calibration_size
-    fit_end >= MIN_TRAIN_SAMPLES ||
-        throw(ArgumentError("not enough training samples after calibration split"))
-    return X[1:fit_end, :], y[1:fit_end], X[(fit_end + 1):end, :]
+    first_train_end = max(MIN_TRAIN_SAMPLES, fld(n, 2))
+    first_train_end < n || throw(ArgumentError("not enough samples for OOS calibration"))
+    split_rng = MersenneTwister(666)
+    predictions = Float64[]
+    train_end = first_train_end
+
+    for split_index in 1:2
+        validation_end = split_index == 2 ? n : train_end + cld(n - train_end, 2)
+        labels = y[1:train_end]
+        if shuffle_targets
+            labels = labels[randperm(split_rng, length(labels))]
+        end
+        machine_model, best_idx, means, scales = fit_best_model(X[1:train_end, :], labels)
+        X_oos = standardize_features(X[(train_end + 1):validation_end, :], means, scales)
+        append!(predictions, predict(machine_model, (data = X_oos, idx = best_idx)))
+        train_end = validation_end
+    end
+
+    length(predictions) >= 2 && all(isfinite, predictions) ||
+        throw(ArgumentError("invalid OOS calibration predictions"))
+    return predictions
 end
 
 function fit_and_evaluate(X_train, y_train, X_valid, y_valid, annual_periods)
-    X_fit, y_fit, X_calibration = calibration_split(X_train, y_train)
-    machine_model = machine(make_model(), X_fit, y_fit)
-    fit!(machine_model, verbosity = 0)
-
-    report_data = report(machine_model)
-    best_idx = report_data.best_idx
-    equation = string(report_data.equations[best_idx])
-    calibration_prediction = predict(machine_model, (data = X_calibration, idx = best_idx))
+    machine_model, best_idx, feature_mean, feature_std = fit_best_model(X_train, y_train)
+    equation = string(report(machine_model).equations[best_idx])
+    calibration_prediction = oos_calibration_predictions(X_train, y_train)
     calibration_mean = mean(calibration_prediction)
-    calibration_std = std(calibration_prediction)
-    validation_prediction = predict(machine_model, (data = X_valid, idx = best_idx))
+    calibration_std = std(calibration_prediction; corrected = true)
+    X_valid_normalized = standardize_features(X_valid, feature_mean, feature_std)
+    validation_prediction = predict(machine_model, (data = X_valid_normalized, idx = best_idx))
 
     metrics = backtest_metrics(
         y_valid, validation_prediction, calibration_mean, calibration_std;
         annual_periods,
     )
-    return equation, metrics, calibration_mean, calibration_std
+    return equation, metrics, calibration_mean, calibration_std, feature_mean, feature_std
 end
 
 function shuffle_control(X_train, y_train, X_valid, y_valid, annual_periods)
-    X_fit, y_fit, X_calibration = calibration_split(X_train, y_train)
-    Random.seed!(666)
-    shuffled_labels = y_fit[randperm(length(y_fit))]
-    machine_model = machine(make_model(), X_fit, shuffled_labels)
-    fit!(machine_model, verbosity = 0)
-
-    report_data = report(machine_model)
-    best_idx = report_data.best_idx
-    calibration_prediction = predict(machine_model, (data = X_calibration, idx = best_idx))
+    shuffle_rng = MersenneTwister(666)
+    shuffled_labels = y_train[randperm(shuffle_rng, length(y_train))]
+    machine_model, best_idx, feature_mean, feature_std = fit_best_model(X_train, shuffled_labels)
+    calibration_prediction = oos_calibration_predictions(
+        X_train, y_train; shuffle_targets = true,
+    )
     calibration_mean = mean(calibration_prediction)
-    calibration_std = std(calibration_prediction)
-    validation_prediction = predict(machine_model, (data = X_valid, idx = best_idx))
+    calibration_std = std(calibration_prediction; corrected = true)
+    X_valid_normalized = standardize_features(X_valid, feature_mean, feature_std)
+    validation_prediction = predict(machine_model, (data = X_valid_normalized, idx = best_idx))
     return backtest_metrics(
         y_valid, validation_prediction, calibration_mean, calibration_std;
         annual_periods,
@@ -345,7 +350,7 @@ function walk_forward(X, raw_returns; annual_periods, n_folds = FOLDS, embargo =
             log_fold_metrics(last(fold_metrics))
             continue
         end
-        min_train_for_calibration = MIN_TRAIN_SAMPLES + max(2, round(Int, 0.2 * train_end))
+        min_train_for_calibration = MIN_TRAIN_SAMPLES + 2
         if train_end < min_train_for_calibration || validation_start > validation_end
             @debug "Skipping fold $(fold_index): insufficient samples (train_end=$(train_end), val=$(validation_start):$(validation_end))"
             push!(fold_metrics, merge(
@@ -365,7 +370,7 @@ function walk_forward(X, raw_returns; annual_periods, n_folds = FOLDS, embargo =
         y_valid = raw_returns[validation_start:validation_end]
 
         equation, metrics = try
-            equation, evaluated_metrics, _, _ =
+            equation, evaluated_metrics, _, _, _, _ =
                 fit_and_evaluate(X_train, y_train, X_valid, y_valid, annual_periods)
             (equation, evaluated_metrics)
         catch err
@@ -413,7 +418,8 @@ function fold_metrics_valid(metric)
     values = (metric.strategy_return, metric.buy_hold_return,
               metric.strategy_sharpe, metric.buy_hold_sharpe,
               metric.strategy_vs_bh_return, metric.strategy_vs_bh_sharpe,
-              metric.turnover, metric.max_drawdown, metric.std_pred)
+              metric.turnover, metric.max_drawdown, metric.t_stat,
+              metric.bootstrap_mean_lower, metric.std_pred)
     return all(value -> value !== nothing && isfinite(value), values)
 end
 
@@ -423,6 +429,8 @@ function aggregate_metrics(metrics, expected_folds)
     buy_hold_sharpes = [metric.buy_hold_sharpe for metric in valid_metrics]
     strategy_t_stats = filter(value -> value !== nothing && isfinite(value),
                               [metric.t_stat for metric in valid_metrics])
+    bootstrap_lower_bounds = [metric.bootstrap_mean_lower for metric in valid_metrics]
+    average_turnovers = [metric.turnover / metric.sample_count for metric in valid_metrics]
     bh_return_wins = count(metric -> metric.strategy_return > metric.buy_hold_return,
                            valid_metrics)
     bh_sharpe_wins = count(metric -> metric.strategy_sharpe > metric.buy_hold_sharpe,
@@ -459,34 +467,50 @@ function aggregate_metrics(metrics, expected_folds)
         iqr_fold_sharpe = isempty(strategy_sharpes) ? nothing :
                           quantile(strategy_sharpes, 0.75) - quantile(strategy_sharpes, 0.25),
         median_t_stat_diagnostic = isempty(strategy_t_stats) ? nothing : median(strategy_t_stats),
+        median_bootstrap_mean_lower = isempty(bootstrap_lower_bounds) ? nothing :
+                                      median(bootstrap_lower_bounds),
+        median_average_turnover = isempty(average_turnovers) ? nothing : median(average_turnovers),
     )
 end
 
 function acceptance_gates(valid_folds, bh_return_wins, positive_sharpe_folds,
-                          shuffle_pass, expected_folds)
+                          shuffle_pass, expected_folds, median_t_stat,
+                          median_bootstrap_mean_lower, median_average_turnover)
     expected_folds > 0 || return (
         all_folds_valid = false,
         bh_consistency = false,
         positive_sharpe_consistency = false,
         shuffle = false,
+        hac_t_stat = false,
+        bootstrap_ci = false,
+        turnover = false,
         required_bh_wins = 0,
         required_positive_sharpe_folds = 0,
         accepted = false,
     )
-    required_bh_wins = expected_folds - 1
-    required_positive_sharpe_folds = cld(2 * expected_folds, 3)
+    required_bh_wins = ceil(Int, 0.6 * expected_folds)
+    required_positive_sharpe_folds = ceil(Int, 0.6 * expected_folds)
     valid = valid_folds == expected_folds
     bh_consistency = valid && bh_return_wins >= required_bh_wins
     positive_sharpe_consistency = valid &&
                                   positive_sharpe_folds >= required_positive_sharpe_folds
+    hac_t_stat_pass = valid && median_t_stat !== nothing && median_t_stat >= 1.5
+    bootstrap_ci_pass = valid && median_bootstrap_mean_lower !== nothing &&
+                        median_bootstrap_mean_lower > 0
+    turnover_pass = valid && median_average_turnover !== nothing &&
+                    median_average_turnover <= MAX_AVG_TURNOVER
     return (
         all_folds_valid = valid,
         bh_consistency = bh_consistency,
         positive_sharpe_consistency = positive_sharpe_consistency,
         shuffle = valid && shuffle_pass,
+        hac_t_stat = hac_t_stat_pass,
+        bootstrap_ci = bootstrap_ci_pass,
+        turnover = turnover_pass,
         required_bh_wins = required_bh_wins,
         required_positive_sharpe_folds = required_positive_sharpe_folds,
-        accepted = valid && bh_consistency && positive_sharpe_consistency && shuffle_pass,
+        accepted = valid && bh_consistency && positive_sharpe_consistency &&
+               shuffle_pass && hac_t_stat_pass && bootstrap_ci_pass && turnover_pass,
     )
 end
 
@@ -495,9 +519,9 @@ function rejected(reason; validation = nothing)
             validation = validation, reason = reason)
 end
 
-function discover(X, raw_returns, timestamps; k_bars = 1)
+function discover(X, raw_returns, timestamps; is_crypto = false, k_bars = 1)
     n_total = size(X, 1)
-    annual_periods = periods_per_year(timestamps)
+    annual_periods = periods_per_year(is_crypto)
 
     if n_total - MIN_TRAIN_SAMPLES < 5
         @warn "Not enough samples beyond MIN_TRAIN_SAMPLES=$(MIN_TRAIN_SAMPLES): n=$(n_total)"
@@ -533,6 +557,9 @@ function discover(X, raw_returns, timestamps; k_bars = 1)
         aggregate.positive_sharpe_folds,
         aggregate.shuffle_pass,
         FOLDS,
+        aggregate.median_t_stat_diagnostic,
+        aggregate.median_bootstrap_mean_lower,
+        aggregate.median_average_turnover,
     )
     validation = (summary = merge(aggregate, gates), folds = fold_metrics)
     @info "Validation summary:\n  folds=$(aggregate.folds)\n  valid_folds=$(aggregate.valid_folds)/$(aggregate.expected_folds)\n  B&H wins=$(aggregate.bh_return_wins)/$(aggregate.expected_folds)\n  required B&H wins=$(gates.required_bh_wins)\n  positive Sharpe=$(aggregate.positive_sharpe_folds)/$(aggregate.expected_folds)\n  required positive Sharpe=$(gates.required_positive_sharpe_folds)\n  shuffle wins=$(aggregate.shuffle_wins)/$(aggregate.expected_folds)\n  required shuffle wins=$(aggregate.required_shuffle_wins)\n  shuffle_pass=$(aggregate.shuffle_pass)\n  median_strategy_sharpe=$(format_metric(aggregate.median_strategy_sharpe))\n  mean_strategy_sharpe=$(format_metric(aggregate.mean_strategy_sharpe))\n  median_buy_hold_sharpe=$(format_metric(aggregate.median_buy_hold_sharpe))\n  mean_buy_hold_sharpe=$(format_metric(aggregate.mean_buy_hold_sharpe))\n  worst_fold_sharpe=$(format_metric(aggregate.worst_fold_sharpe))\n  median_t_stat_diagnostic=$(format_metric(aggregate.median_t_stat_diagnostic))\n  accepted=$(gates.accepted)"
@@ -543,7 +570,7 @@ function discover(X, raw_returns, timestamps; k_bars = 1)
     end
 
     @info "Running final holdout evaluation on $(effective_holdout_size) samples"
-    equation, holdout, prediction_mean, prediction_std = try
+    equation, holdout, prediction_mean, prediction_std, feature_mean, feature_std = try
         fit_and_evaluate(
             X[1:final_train_end, :], raw_returns[1:final_train_end],
             X[holdout_start:holdout_end, :], raw_returns[holdout_start:holdout_end],
@@ -574,6 +601,8 @@ function discover(X, raw_returns, timestamps; k_bars = 1)
         equation = equation,
         prediction_mean = prediction_mean,
         prediction_std = prediction_std,
+        feature_mean = feature_mean,
+        feature_std = feature_std,
         n = n_total,
         metrics = (
             sharpe = holdout.strategy_sharpe,
@@ -615,6 +644,7 @@ function main(io = stdin)
     y = Float64.(payload.target_scaled_return)
     scales = Float64.(payload.target_scales)
     timestamps = Int64.(get(payload, :target_timestamps, Int64[]))
+    is_crypto = Bool(get(payload, :is_crypto, false))
 
     @info "Processing $(length(rows)) samples"
 
@@ -624,7 +654,7 @@ function main(io = stdin)
     else
         @info "Input validated, starting discovery"
         raw_returns = y .* scales
-        result = discover(rows_to_matrix(rows), raw_returns, timestamps;
+        result = discover(rows_to_matrix(rows), raw_returns, timestamps; is_crypto,
                           k_bars = Int(get(payload, :k_bars, 1)))
         @info "Discovery complete, status: $(result.status)"
         JSON3.write(stdout, result)
@@ -639,9 +669,28 @@ function selftest()
     @assert Logging.shouldlog(logger, Logging.Info, @__MODULE__, :test, :info)
     raw_returns = [0.01, -0.01]
     prediction = [1.0, -1.0]
-    annual_periods = periods_per_year([0, 3600, 7200])
-    @assert isapprox(annual_periods, SECONDS_PER_YEAR / 3600)
-        @assert sharpe_ratio(ones(4), annual_periods) === nothing
+    annual_periods = periods_per_year(false)
+    @assert annual_periods == 252 * 2
+    @assert periods_per_year(true) == 365 * 6
+    @assert sharpe_ratio(ones(4), annual_periods) === nothing
+    @assert bounded_sharpe_loss(-3.0) == 3.0
+    @assert bounded_sharpe_loss(3.0) == -3.0
+    @assert isapprox((bounded_sharpe_loss(3.001) - bounded_sharpe_loss(2.999)) / 0.002, -1.0)
+    @assert bounded_sharpe_loss(Inf) == Inf
+    feature_means, feature_scales = feature_scaling([1.0 4.0; 3.0 4.0; 5.0 4.0])
+    normalized_features = standardize_features(
+        [1.0 4.0; 3.0 4.0; 5.0 4.0], feature_means, feature_scales,
+    )
+    @assert all(isfinite, normalized_features)
+    @assert isapprox(mean(normalized_features[:, 1]), 0.0; atol = 1e-12)
+    @assert all(normalized_features[:, 2] .== 0.0)
+    sr_model = make_model()
+    @assert sr_model.niterations == 500
+    @assert sr_model.populations == 30 && sr_model.population_size == 27
+    @assert sr_model.maxsize == 12 && sr_model.maxdepth == 6
+    @assert sr_model.loss_scale == :linear
+    @assert sr_model.binary_operators == [+, -, *, /]
+    @assert sr_model.unary_operators == [sqrt, square, tanh, relu]
     metrics = backtest_metrics(
         raw_returns, prediction, 0.0, 1.0;
         annual_periods, cost_rate = 0.001,
@@ -665,7 +714,8 @@ function selftest()
     @assert hac_t_stat(ones(4)) === nothing
     @assert isfinite(hac_t_stat([0.01, -0.02, 0.03, -0.01, 0.02]))
     synthetic_fold = function (strategy_return, bh_return, strategy_sharpe,
-                               bh_sharpe, shuffle_sharpe; valid = true, samples = 10)
+                               bh_sharpe, shuffle_sharpe; valid = true, samples = 10,
+                               hac = 2.0, bootstrap_lower = 0.01, avg_turnover = 0.1)
         return (
             valid = valid,
             sample_count = samples,
@@ -675,15 +725,17 @@ function selftest()
             buy_hold_sharpe = bh_sharpe,
             strategy_vs_bh_return = strategy_return - bh_return,
             strategy_vs_bh_sharpe = strategy_sharpe - bh_sharpe,
-            turnover = 1.0,
+            turnover = avg_turnover * samples,
             max_drawdown = -0.1,
             std_pred = 1.0,
-            t_stat = nothing,
+            t_stat = hac,
+            bootstrap_mean_lower = bootstrap_lower,
             shuffle_sharpe = shuffle_sharpe,
         )
     end
     test_folds = function (n, bh_wins, positive_folds; shuffle_wins = n,
-                           extreme_negative = false)
+                           extreme_negative = false, hac = 2.0,
+                           bootstrap_lower = 0.01, avg_turnover = 0.1)
         return [
             synthetic_fold(
                 index <= bh_wins ? 0.1 : -0.1,
@@ -694,6 +746,8 @@ function selftest()
                 index <= shuffle_wins ?
                     (index <= positive_folds ? 0.0 : -2.0) :
                     (index <= positive_folds ? 2.0 : 0.0),
+                hac = hac, bootstrap_lower = bootstrap_lower,
+                avg_turnover = avg_turnover,
             ) for index in 1:n
         ]
     end
@@ -701,7 +755,10 @@ function selftest()
         aggregate = aggregate_metrics(folds, n)
         gates = acceptance_gates(aggregate.valid_folds, aggregate.bh_return_wins,
                                  aggregate.positive_sharpe_folds,
-                                 aggregate.shuffle_pass, n)
+                                 aggregate.shuffle_pass, n,
+                                 aggregate.median_t_stat_diagnostic,
+                                 aggregate.median_bootstrap_mean_lower,
+                                 aggregate.median_average_turnover)
         return aggregate, gates
     end
     aggregate, gates = check_gates(test_folds(8, 8, 8), 8)
@@ -715,9 +772,9 @@ function selftest()
             negative_sharpe_comparison.buy_hold_sharpe
         @assert negative_sharpe_comparison.strategy_return <
             negative_sharpe_comparison.buy_hold_return
-    aggregate, gates = check_gates(test_folds(8, 6, 8), 8)
+    aggregate, gates = check_gates(test_folds(8, 4, 8), 8)
     @assert !gates.accepted
-    aggregate, gates = check_gates(test_folds(8, 7, 5), 8)
+    aggregate, gates = check_gates(test_folds(8, 7, 4), 8)
     @assert !gates.accepted
     aggregate, gates = check_gates(test_folds(8, 7, 6; shuffle_wins = 0), 8)
     @assert !gates.accepted && !aggregate.shuffle_pass
@@ -736,11 +793,17 @@ function selftest()
     undefined_shuffle = [merge(fold, (shuffle_sharpe = nothing,))
                          for fold in test_folds(8, 8, 8)]
     @assert !first(check_gates(undefined_shuffle, 8)).shuffle_pass
-    aggregate, gates = check_gates(test_folds(6, 5, 4), 6)
-    @assert gates.accepted
-    @assert gates.required_bh_wins == 5
-    @assert gates.required_positive_sharpe_folds == 4
+    aggregate, gates = check_gates(test_folds(5, 5, 5; hac = 1.4), 5)
+    @assert !gates.hac_t_stat && !gates.accepted
+    aggregate, gates = check_gates(test_folds(5, 5, 5; bootstrap_lower = -0.001), 5)
+    @assert !gates.bootstrap_ci && !gates.accepted
+    aggregate, gates = check_gates(test_folds(5, 5, 5; avg_turnover = 0.51), 5)
+    @assert !gates.turnover && !gates.accepted
     aggregate, gates = check_gates(test_folds(6, 4, 4), 6)
+    @assert gates.accepted
+    @assert gates.required_bh_wins == 4
+    @assert gates.required_positive_sharpe_folds == 4
+    aggregate, gates = check_gates(test_folds(6, 3, 4), 6)
     @assert !gates.accepted
     aggregate, gates = check_gates(test_folds(3, 2, 2), 3)
     @assert gates.accepted
@@ -756,10 +819,6 @@ function selftest()
     @assert !insufficient.valid && insufficient.sample_count == 1
     @assert !valid_input([[0.0 for _ in 1:8]], [0.0, 0.0], [1.0], [1])
     @assert discover(zeros(2, 8), [0.0, 0.0], [1, 2]).status == "rejected"
-    X_fit, y_fit, X_calibration =
-        calibration_split(reshape(Float64.(1:100), :, 1), Float64.(1:100))
-    @assert size(X_fit, 1) == length(y_fit) == 80
-    @assert X_fit[end, 1] < X_calibration[1, 1]
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
