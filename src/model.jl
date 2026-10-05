@@ -3,7 +3,7 @@ using MLJ
 using JSON3
 using Statistics
 using Random
-using SymbolicRegression: eval_tree_array
+using SymbolicRegression: eval_tree_array, compute_complexity
 using LoopVectorization
 using Logging
 
@@ -24,8 +24,8 @@ Logging.handle_message(logger::WarningFilterLogger, args...; kwargs...) =
 const logger = WarningFilterLogger(ConsoleLogger(stderr, Logging.Debug))
 global_logger(logger)
 
-const BUDGET = 300
-const POPULATIONS = 30
+const BUDGET = 200
+const POPULATIONS = 20
 const POPULATION_SIZE = 27
 const FOLDS = 9
 
@@ -182,7 +182,29 @@ function backtest_metrics(raw_returns, prediction, calibration_mean, calibration
     )
 end
 
-function training_loss(tree, dataset, options)
+function objective_loss(net_returns, traded_notional, complexity;
+                        alpha, beta, gamma)
+    n = length(net_returns)
+    n >= 2 && length(traded_notional) == n && all(isfinite, net_returns) &&
+        all(isfinite, traded_notional) && isfinite(complexity) || return Inf
+    all(isfinite, (alpha, beta, gamma)) &&
+        all(weight -> weight >= 0, (alpha, beta, gamma)) || return Inf
+
+    downside_deviation = sqrt(mean(min(return_value, 0.0)^2 for return_value in net_returns))
+    average_return = mean(net_returns)
+    sortino = if downside_deviation <= 1e-12
+        average_return > 0 ? 10.0 : average_return < 0 ? -10.0 : 0.0
+    else
+        average_return / downside_deviation
+    end
+    loss = -clamp(sortino, -10.0, 10.0) +
+           alpha * -max_drawdown(net_returns) +
+           beta * mean(traded_notional) +
+           gamma * complexity
+    return isfinite(loss) ? loss : Inf
+end
+
+function training_loss(tree, dataset, options; alpha, beta, gamma)
     prediction, completed = try
         eval_tree_array(tree, dataset.X, options)
     catch
@@ -193,11 +215,11 @@ function training_loss(tree, dataset, options)
     invalid && return Inf
 
     positions = prediction_positions(prediction, mean(prediction), std(prediction))
-    net_returns, _ = strategy_returns(dataset.y, positions)
-    net_std = std(net_returns)
-    (!isfinite(net_std) || net_std <= 1e-12) && return Inf
-    sharpe = mean(net_returns) / net_std
-    return bounded_sharpe_loss(sharpe)
+    net_returns, traded_notional = strategy_returns(dataset.y, positions)
+    return objective_loss(
+        net_returns, traded_notional, compute_complexity(tree, options);
+        alpha, beta, gamma,
+    )
 end
 
 bounded_sharpe_loss(sharpe) = isfinite(sharpe) ? -clamp(sharpe, -10.0, 10.0) : Inf
@@ -222,7 +244,9 @@ function bootstrap_mean_lower(returns; replicates = BOOTSTRAP_REPLICATES)
     return quantile(bootstrap_means, 0.025)
 end
 
-function make_model(; parsimony_multiplier = 0.02)
+function make_model(; alpha = 0.1, beta = 0.01, gamma = 0.001)
+    loss_function = (tree, dataset, options) ->
+        training_loss(tree, dataset, options; alpha, beta, gamma)
     return SRRegressor(
         niterations = BUDGET,
         populations = POPULATIONS,
@@ -240,8 +264,8 @@ function make_model(; parsimony_multiplier = 0.02)
         ),
         maxsize = 12,
         maxdepth = 6,
-        parsimony = parsimony_multiplier,
-        loss_function = training_loss,
+        parsimony = 0.0,
+        loss_function = loss_function,
         loss_scale = :linear,
         elementwise_loss = nothing,
         batching = false,
@@ -394,7 +418,7 @@ function walk_forward(X, raw_returns; annual_periods, n_folds = FOLDS, embargo =
             shuffle_sharpe = shuffle_sharpe,
             shuffle_pass = shuffle_pass,
         ))
-        log_fold_metrics(fold_record; equation)
+        log_fold_metrics(fold_record)
         push!(fold_metrics, fold_record)
     end
     @debug "Walk-forward produced $(count(fold_metrics_valid, fold_metrics)) valid folds out of $(n_folds)"
@@ -405,12 +429,8 @@ end
 format_metric(value; digits = 3) =
     value === nothing ? "undefined" : string(round(value, digits = digits))
 
-function log_fold_metrics(metric; equation = nothing)
-    valid = fold_metrics_valid(metric)
-    beats_bh_return = valid && metric.strategy_return > metric.buy_hold_return
-    beats_bh_sharpe = valid && metric.strategy_sharpe > metric.buy_hold_sharpe
-    positive_sharpe = valid && metric.strategy_sharpe > 0
-    @info "Fold $(metric.fold):\n  strategy_return=$(format_metric(metric.strategy_return))\n  buy_hold_return=$(format_metric(metric.buy_hold_return))\n  strategy_sharpe=$(format_metric(metric.strategy_sharpe))\n  buy_hold_sharpe=$(format_metric(metric.buy_hold_sharpe))\n  strategy_vs_bh_return=$(format_metric(metric.strategy_vs_bh_return))\n  strategy_vs_bh_sharpe=$(format_metric(metric.strategy_vs_bh_sharpe))\n  beats_bh_return=$(beats_bh_return)\n  beats_bh_sharpe=$(beats_bh_sharpe)\n  positive_sharpe=$(positive_sharpe)\n  shuffle_return=$(format_metric(metric.shuffle_return))\n  shuffle_sharpe=$(format_metric(metric.shuffle_sharpe))\n  shuffle_pass=$(metric.shuffle_pass)\n  turnover=$(format_metric(metric.turnover))\n  samples=$(metric.sample_count)\n  valid=$(valid) reason=$(metric.invalid_reason) t_stat_diagnostic=$(format_metric(metric.t_stat)) equation=$(equation)"
+function log_fold_metrics(metric)
+    @info "Fold $(metric.fold): buy_hold_sharpe=$(format_metric(metric.buy_hold_sharpe)), strategy_sharpe=$(format_metric(metric.strategy_sharpe)), hac_t_stat=$(format_metric(metric.t_stat)), turnover=$(format_metric(metric.turnover))"
 end
 
 function fold_metrics_valid(metric)
@@ -562,7 +582,7 @@ function discover(X, raw_returns, timestamps; is_crypto = false, k_bars = 1)
         aggregate.median_average_turnover,
     )
     validation = (summary = merge(aggregate, gates), folds = fold_metrics)
-    @info "Validation summary:\n  folds=$(aggregate.folds)\n  valid_folds=$(aggregate.valid_folds)/$(aggregate.expected_folds)\n  B&H wins=$(aggregate.bh_return_wins)/$(aggregate.expected_folds)\n  required B&H wins=$(gates.required_bh_wins)\n  positive Sharpe=$(aggregate.positive_sharpe_folds)/$(aggregate.expected_folds)\n  required positive Sharpe=$(gates.required_positive_sharpe_folds)\n  shuffle wins=$(aggregate.shuffle_wins)/$(aggregate.expected_folds)\n  required shuffle wins=$(aggregate.required_shuffle_wins)\n  shuffle_pass=$(aggregate.shuffle_pass)\n  median_strategy_sharpe=$(format_metric(aggregate.median_strategy_sharpe))\n  mean_strategy_sharpe=$(format_metric(aggregate.mean_strategy_sharpe))\n  median_buy_hold_sharpe=$(format_metric(aggregate.median_buy_hold_sharpe))\n  mean_buy_hold_sharpe=$(format_metric(aggregate.mean_buy_hold_sharpe))\n  worst_fold_sharpe=$(format_metric(aggregate.worst_fold_sharpe))\n  median_t_stat_diagnostic=$(format_metric(aggregate.median_t_stat_diagnostic))\n  accepted=$(gates.accepted)"
+    @info "Validation: valid_folds=$(aggregate.valid_folds)/$(aggregate.expected_folds), B&H_wins=$(aggregate.bh_return_wins)/$(aggregate.expected_folds), positive_Sharpe_folds=$(aggregate.positive_sharpe_folds)/$(aggregate.expected_folds), shuffle_wins=$(aggregate.shuffle_wins)/$(aggregate.expected_folds), median_Sharpe=$(format_metric(aggregate.median_strategy_sharpe)), median_HAC_t=$(format_metric(aggregate.median_t_stat_diagnostic)), median_bootstrap_lower=$(format_metric(aggregate.median_bootstrap_mean_lower)), median_avg_turnover=$(format_metric(aggregate.median_average_turnover)), accepted=$(gates.accepted)"
 
     if !gates.accepted
         @warn "Walk-forward robustness validation failed"
@@ -581,13 +601,7 @@ function discover(X, raw_returns, timestamps; is_crypto = false, k_bars = 1)
         return rejected("final holdout evaluation failed"; validation)
     end
 
-    @info "Annualization: $(round(annual_periods, digits=1)) observed candles/year"
-    @info "Holdout metrics: strategy_return=$(format_metric(holdout.strategy_return)), " *
-          "buy_hold_return=$(format_metric(holdout.buy_hold_return)), " *
-          "strategy_sharpe=$(format_metric(holdout.strategy_sharpe)), " *
-          "buy_hold_sharpe=$(format_metric(holdout.buy_hold_sharpe)), " *
-          "turnover=$(format_metric(holdout.turnover)), " *
-          "samples=$(holdout.sample_count), t_stat_diagnostic=$(format_metric(holdout.t_stat))"
+    @info "Holdout ($(holdout.sample_count) samples, annualization=$(round(annual_periods, digits=1))/year): strategy_return=$(format_metric(holdout.strategy_return)), buy_hold_return=$(format_metric(holdout.buy_hold_return)), strategy_sharpe=$(format_metric(holdout.strategy_sharpe)), buy_hold_sharpe=$(format_metric(holdout.buy_hold_sharpe)), HAC_t=$(format_metric(holdout.t_stat)), turnover=$(format_metric(holdout.turnover))"
 
     if !fold_metrics_valid(holdout)
         @warn "Final holdout metrics are numerically invalid: $(holdout.invalid_reason)"
@@ -677,6 +691,23 @@ function selftest()
     @assert bounded_sharpe_loss(3.0) == -3.0
     @assert isapprox((bounded_sharpe_loss(3.001) - bounded_sharpe_loss(2.999)) / 0.002, -1.0)
     @assert bounded_sharpe_loss(Inf) == Inf
+    objective_returns = [0.1, -0.05, 0.02, -0.01]
+    objective_turnover = [0.1, 0.2, 0.3, 0.4]
+    objective_sortino = mean(objective_returns) /
+                        sqrt(mean(min(return_value, 0.0)^2 for return_value in objective_returns))
+    expected_loss = -objective_sortino +
+                    0.1 * -max_drawdown(objective_returns) +
+                    0.01 * mean(objective_turnover) + 0.001 * 3
+    @assert isapprox(
+        objective_loss(objective_returns, objective_turnover, 3;
+                       alpha = 0.1, beta = 0.01, gamma = 0.001),
+        expected_loss,
+    )
+    @assert isapprox(
+        objective_loss(objective_returns, objective_turnover, 4;
+                       alpha = 0.1, beta = 0.01, gamma = 0.001) - expected_loss,
+        0.001,
+    )
     feature_means, feature_scales = feature_scaling([1.0 4.0; 3.0 4.0; 5.0 4.0])
     normalized_features = standardize_features(
         [1.0 4.0; 3.0 4.0; 5.0 4.0], feature_means, feature_scales,
@@ -685,7 +716,7 @@ function selftest()
     @assert isapprox(mean(normalized_features[:, 1]), 0.0; atol = 1e-12)
     @assert all(normalized_features[:, 2] .== 0.0)
     sr_model = make_model()
-    @assert sr_model.niterations == 500
+    @assert sr_model.niterations == BUDGET
     @assert sr_model.populations == 30 && sr_model.population_size == 27
     @assert sr_model.maxsize == 12 && sr_model.maxdepth == 6
     @assert sr_model.loss_scale == :linear

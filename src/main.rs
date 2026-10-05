@@ -22,7 +22,7 @@ const SOURCE_INTERVAL_HOURS: i64 = 1;
 const BAR_INTERVAL_HOURS: i64 = 4;
 
 const MODEL_VERSION: &str =
-    "2026-10-03/features-v4-standardized-oos-4h-robust-gates-v2";
+    "2026-10-03/features-v4-standardized-oos-4h-robust-gates-v2-sortino-loss-v1";
 
 #[derive(Deserialize, Debug)]
 struct Payload {
