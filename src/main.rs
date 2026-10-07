@@ -1,28 +1,25 @@
-use chrono::{Datelike, Duration, Timelike, Utc};
+use chrono::{Duration, Utc};
 use log::{debug, error, info, warn};
-use meval;
 use num_traits::cast::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     env, fs,
     io::{BufWriter, Write},
     process::{Command, Stdio},
 };
 use yfinance_rs::{Interval, Range, Ticker, YfClient};
-use chrono_tz::America::New_York;
 
 const VOL_WINDOW: usize = 20;
 const FEATURE_WINDOW: usize = 5;
 const N_FEATS: usize = 8;
-const K_BARS: usize = 2;
+const K_BARS: usize = 1;
 const MIN_SIGMA: f64 = 1e-8;
 const MIN_PREDICTION_STD: f64 = 1e-12;
 const SOURCE_INTERVAL_HOURS: i64 = 1;
-const BAR_INTERVAL_HOURS: i64 = 4;
 
 const MODEL_VERSION: &str =
-    "2026-10-03/features-v4-standardized-oos-4h-robust-gates-v2-sortino-loss-v1";
+    "2026-10-06/features-v5-hourly-minmax-relative-bh-turnover-robust-calibration-v7";
 
 #[derive(Deserialize, Debug)]
 struct Payload {
@@ -33,9 +30,9 @@ struct Payload {
     #[serde(default)]
     prediction_std: Option<f64>,
     #[serde(default)]
-    feature_mean: Option<Vec<f64>>,
+    feature_min: Option<Vec<f64>>,
     #[serde(default)]
-    feature_std: Option<Vec<f64>>,
+    feature_max: Option<Vec<f64>>,
     n: usize,
     #[serde(default)]
     metrics: Option<Metrics>,
@@ -63,9 +60,9 @@ struct Checkpoint {
     #[serde(default)]
     prediction_std: Option<f64>,
     #[serde(default)]
-    feature_mean: Option<Vec<f64>>,
+    feature_min: Option<Vec<f64>>,
     #[serde(default)]
-    feature_std: Option<Vec<f64>>,
+    feature_max: Option<Vec<f64>>,
     #[serde(default)]
     rejection_reason: Option<String>,
     first_ts: i64,
@@ -103,66 +100,12 @@ fn all_finite(v: &[f64]) -> bool {
     v.iter().all(|x| x.is_finite())
 }
 
-fn is_crypto_symbol(token: &str) -> bool {
-    token == "BTC" || token.ends_with("-USD") || token.ends_with("-USDT")
+fn position_for(prediction: f64, calibration_mean: f64, calibration_std: f64) -> f64 {
+    ((prediction - calibration_mean) / calibration_std).tanh()
 }
 
-fn aggregate_four_hour_bars(hourly: &[Bar], is_crypto: bool) -> Vec<Bar> {
-    let mut groups: BTreeMap<(i64, i64, usize), Vec<&Bar>> = BTreeMap::new();
-    for bar in hourly {
-        let key = if is_crypto {
-            (0, bar.ts.div_euclid(14_400), 0)
-        } else {
-            let Some(timestamp) = chrono::DateTime::from_timestamp(bar.ts, 0) else {
-                continue;
-            };
-            let local = timestamp.with_timezone(&New_York);
-            let minute_of_day = (local.hour() * 60 + local.minute()) as i64;
-            let minutes_from_open = minute_of_day - 9 * 60 - 30;
-            if !(0..390).contains(&minutes_from_open) {
-                continue;
-            }
-            (
-                local.year() as i64,
-                local.ordinal() as i64,
-                (minutes_from_open / (BAR_INTERVAL_HOURS * 60)) as usize,
-            )
-        };
-        groups.entry(key).or_default().push(bar);
-    }
-
-    let mut aggregated = Vec::new();
-    for ((_, _, group_index), mut bars) in groups {
-        bars.sort_by_key(|bar| bar.ts);
-        let is_full_group = bars.len() == BAR_INTERVAL_HOURS as usize;
-        let is_closing_equity_group = !is_crypto
-            && group_index == 1
-            && bars.len() == 3
-            && bars.last().is_some_and(|bar| {
-                chrono::DateTime::from_timestamp(bar.ts, 0).is_some_and(|timestamp| {
-                    let local = timestamp.with_timezone(&New_York);
-                    local.hour() == 15 && local.minute() == 30
-                })
-            });
-        let contiguous = bars.windows(2).all(|pair| {
-            pair[1].ts - pair[0].ts == Duration::hours(SOURCE_INTERVAL_HOURS).num_seconds()
-        });
-        if bars.is_empty() || !(is_full_group || is_closing_equity_group) || !contiguous {
-            continue;
-        }
-        let first = bars[0];
-        let last = bars[bars.len() - 1];
-        aggregated.push(Bar {
-            ts: first.ts,
-            open: first.open,
-            high: bars.iter().map(|bar| bar.high).fold(f64::NEG_INFINITY, f64::max),
-            low: bars.iter().map(|bar| bar.low).fold(f64::INFINITY, f64::min),
-            close: last.close,
-            volume: bars.iter().map(|bar| bar.volume).sum(),
-        });
-    }
-    aggregated.sort_by_key(|bar| bar.ts);
-    aggregated
+fn is_crypto_symbol(token: &str) -> bool {
+    token == "BTC" || token == "ETH" || token.ends_with("-USD") || token.ends_with("-USDT")
 }
 
 fn build_dataset(bars: &[Bar]) -> Dataset {
@@ -288,7 +231,7 @@ async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
     let client = YfClient::default();
     let ticker = Ticker::new(&client, token);
     let history = ticker
-        .history(Some(Range::Y2), Some(Interval::I1h), false)
+        .history(Some(Range::Y1), Some(Interval::I1h), false)
         .await?;
     let now = Utc::now();
 
@@ -311,11 +254,17 @@ async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
             })
         })
         .collect::<Vec<_>>();
-    let mut bars = aggregate_four_hour_bars(&hourly_bars, is_crypto_symbol(token));
-    bars.sort_by_key(|bar| bar.ts);
-    debug!("Fetched {} bars for {}", bars.len(), token);
-    let dataset = build_dataset(&bars);
-    debug!("Built dataset with {} samples for {}", dataset.x.len(), token);
+    debug!(
+        "Fetched {} completed hourly bars for {}",
+        hourly_bars.len(),
+        token
+    );
+    let dataset = build_dataset(&hourly_bars);
+    debug!(
+        "Built dataset with {} samples for {}",
+        dataset.x.len(),
+        token
+    );
     Ok(dataset)
 }
 
@@ -338,9 +287,14 @@ fn run(
     });
     debug!(
         "Julia input: features={}, targets={}, scales={}, timestamps={}",
-        x.len(), y.len(), scales.len(), timestamps.len()
+        x.len(),
+        y.len(),
+        scales.len(),
+        timestamps.len()
     );
     let mut child = Command::new(path)
+        .arg("-t")
+        .arg("auto")
         .arg("src/model.jl")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -370,26 +324,36 @@ fn checkpoint_is_valid(c: &Checkpoint, data: &Dataset) -> bool {
         && c.prediction_mean.is_some_and(f64::is_finite)
         && c.prediction_std
             .is_some_and(|v| v.is_finite() && v > MIN_PREDICTION_STD)
-        && c.feature_mean.as_ref().is_some_and(|values| {
-            values.len() == N_FEATS && all_finite(values)
-        })
-        && c.feature_std.as_ref().is_some_and(|values| {
-            values.len() == N_FEATS && values.iter().all(|v| v.is_finite() && *v > 0.0)
+        && c.feature_min
+            .as_ref()
+            .is_some_and(|values| values.len() == N_FEATS && all_finite(values))
+        && c.feature_max.as_ref().is_some_and(|values| {
+            values.len() == N_FEATS
+                && all_finite(values)
+                && c.feature_min
+                    .as_ref()
+                    .is_some_and(|minimum| minimum.iter().zip(values).all(|(min, max)| min <= max))
         })
         && c.first_ts == data.first_ts
         && c.last_ts == data.last_ts
         && approx_eq(&c.history, &data.target_scaled_return)
 }
 
-fn build_context(
-    features: &[f64],
-    means: &[f64],
-    stds: &[f64],
-) -> meval::Context<'static> {
+fn minmax_scale(value: f64, minimum: f64, maximum: f64) -> f64 {
+    if maximum <= minimum {
+        return 0.0;
+    }
+    (2.0 * ((value - minimum) / (maximum - minimum)) - 1.0).clamp(-1.0, 1.0)
+}
+
+fn build_context(features: &[f64], minima: &[f64], maxima: &[f64]) -> meval::Context<'static> {
     let mut ctx = meval::Context::new();
 
     for (i, value) in features.iter().enumerate() {
-        ctx.var(format!("x{}", i + 1), (value - means[i]) / stds[i]);
+        ctx.var(
+            format!("x{}", i + 1),
+            minmax_scale(*value, minima[i], maxima[i]),
+        );
     }
 
     ctx.func("sqrt", |x| x.sqrt());
@@ -400,17 +364,16 @@ fn build_context(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("debug")
-    ).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
     info!("Starting pipeline");
     for token in env::args().skip(1) {
         info!("Processing token: {}", token);
         let data = fetch(&token)?;
         if data.x.len() < 50 {
             warn!(
-                "{}: insufficient valid completed 4-hour history ({} samples)",
-                token, data.x.len()
+                "{}: insufficient valid completed hourly history ({} samples)",
+                token,
+                data.x.len()
             );
             continue;
         }
@@ -427,23 +390,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok());
         let cache_valid = old.as_ref().is_some_and(|c| checkpoint_is_valid(c, &data));
-        
+
         if cache_valid {
             info!("Using cached checkpoint for {}", token);
         } else {
-            info!("Cache invalid or missing, running Julia model for {}", token);
+            info!(
+                "Cache invalid or missing, running Julia model for {}",
+                token
+            );
         }
-        
+
         let payload = if cache_valid {
             let c = old.as_ref().unwrap();
-            debug!("Loading cached model: status={}, equation={:?}", c.status, c.equation);
+            debug!(
+                "Loading cached model: status={}, equation={:?}",
+                c.status, c.equation
+            );
             Payload {
                 status: c.status.clone(),
                 equation: c.equation.clone(),
                 prediction_mean: c.prediction_mean,
                 prediction_std: c.prediction_std,
-                feature_mean: c.feature_mean.clone(),
-                feature_std: c.feature_std.clone(),
+                feature_min: c.feature_min.clone(),
+                feature_max: c.feature_max.clone(),
                 n: c.sample_count,
                 metrics: c.metrics.clone(),
                 validation: c.validation.clone(),
@@ -472,8 +441,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             equation: payload.equation.clone(),
             prediction_mean: payload.prediction_mean,
             prediction_std: payload.prediction_std,
-            feature_mean: payload.feature_mean.clone(),
-            feature_std: payload.feature_std.clone(),
+            feature_min: payload.feature_min.clone(),
+            feature_max: payload.feature_max.clone(),
             rejection_reason: payload.reason.clone(),
             first_ts: data.first_ts,
             last_ts: data.last_ts,
@@ -502,19 +471,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|v| v.is_finite() && *v > MIN_PREDICTION_STD)
             .ok_or("accepted model without positive prediction standard deviation")?;
         debug!("Evaluating equation: {}", equation);
-        let means = payload.feature_mean.as_deref().ok_or("accepted model without feature means")?;
-        let stds = payload.feature_std.as_deref().ok_or("accepted model without feature scales")?;
-        let ctx = build_context(&data.last_features, means, stds);
+        let minima = payload
+            .feature_min
+            .as_deref()
+            .ok_or("accepted model without feature minima")?;
+        let maxima = payload
+            .feature_max
+            .as_deref()
+            .ok_or("accepted model without feature maxima")?;
+        let ctx = build_context(&data.last_features, minima, maxima);
         match meval::eval_str_with_context(equation, &ctx) {
             Ok(prediction) if prediction.is_finite() => {
-                let position = ((prediction - prediction_mean) / prediction_std).tanh();
+                let scale = data.last_features[N_FEATS - 1];
+                let raw_return = prediction * scale;
+                let position = position_for(prediction, prediction_mean, prediction_std);
                 info!(
-                    "Prediction for {}: raw_return={}, position={}",
-                    token, prediction, position
+                    "Prediction for {}: scaled={}, raw_return={}, position={}",
+                    token, prediction, raw_return, position
                 );
                 println!(
-                    "predicted close-to-close return for next 4-hour candle of {token}: {prediction}; position: {position}"
-                )
+                    "predicted close-to-close return for next hourly candle of {token}: {raw_return}; position: {position}"
+                );
             }
             Ok(_) => warn!("Non-finite equation result for {}", token),
             Err(e) => error!("Evaluation error for {}: {}", token, e),
@@ -527,7 +504,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     fn bars() -> Vec<Bar> {
         (0..16)
             .map(|i| {
@@ -544,57 +520,29 @@ mod tests {
             .collect()
     }
     #[test]
-    fn crypto_bars_aggregate_on_utc_four_hour_boundaries() {
-        let hourly: Vec<Bar> = (0..7)
-            .map(|i| Bar {
-                ts: i * 3600,
-                open: 100.0 + i as f64,
-                high: 102.0 + i as f64,
-                low: 99.0 + i as f64,
-                close: 101.0 + i as f64,
-                volume: 10.0,
-            })
-            .collect();
-
-        let four_hour = aggregate_four_hour_bars(&hourly, true);
-
-        assert_eq!(four_hour.len(), 1);
-        assert_eq!(four_hour[0].ts, 0);
-        assert_eq!(four_hour[0].open, 100.0);
-        assert_eq!(four_hour[0].close, 104.0);
-        assert_eq!(four_hour[0].high, 105.0);
-        assert_eq!(four_hour[0].low, 99.0);
-        assert_eq!(four_hour[0].volume, 40.0);
+    fn live_position_uses_checkpoint_calibration_transform() {
+        let position = position_for(2.0, 1.0, 2.0);
+        assert!((position - 0.46211715726000974).abs() < 1e-15);
+        assert!((-1.0..=1.0).contains(&position_for(1e100, 0.0, 1.0)));
     }
     #[test]
-    fn equity_bars_anchor_to_new_york_session_open() {
-        let session_open = New_York
-            .with_ymd_and_hms(2026, 1, 5, 9, 30, 0)
-            .single()
-            .unwrap()
-            .timestamp();
-        let hourly: Vec<Bar> = (0..7)
-            .map(|i| Bar {
-                ts: session_open + i * 3600,
-                open: 100.0,
-                high: 102.0,
-                low: 99.0,
-                close: 101.0,
-                volume: 10.0,
-            })
-            .collect();
+    fn hourly_bars_are_used_without_aggregation() {
+        let data = build_dataset(&bars());
 
-        let four_hour = aggregate_four_hour_bars(&hourly, false);
-
-        assert_eq!(four_hour.len(), 2);
-        assert_eq!(four_hour[0].ts, session_open);
-        assert_eq!(four_hour[1].ts, session_open + 4 * 3600);
+        assert_eq!(data.x.len(), bars().len() - FEATURE_WINDOW - 1);
+        assert!(
+            data.target_timestamps
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] == Duration::hours(1).num_seconds())
+        );
     }
     #[test]
-    fn inference_context_applies_training_feature_scaling() {
-        let context = build_context(&[3.0, 5.0], &[1.0, 1.0], &[2.0, 2.0]);
-        let value = meval::eval_str_with_context("x1 + sqrt(square(x2))", &context).unwrap();
-        assert!((value - 3.0).abs() < 1e-12);
+    fn inference_context_applies_training_minmax_and_clamps() {
+        let context = build_context(&[4.0, 10.0, 10.0], &[1.0, 1.0, 5.0], &[5.0, 13.0, 5.0]);
+        let value = meval::eval_str_with_context("x1 + x2 + x3", &context).unwrap();
+        assert!((value - 1.0).abs() < 1e-12);
+        assert_eq!(minmax_scale(-100.0, 0.0, 10.0), -1.0);
+        assert_eq!(minmax_scale(100.0, 0.0, 10.0), 1.0);
     }
     #[test]
     fn features_targets_finite_without_lags() {
@@ -634,11 +582,12 @@ mod tests {
 
         let d = build_dataset(&b);
         let skipped_candle_return = (b[19].close - b[17].close) / b[17].close;
-        assert!(!d
-            .target_scaled_return
-            .iter()
-            .zip(&d.target_scales)
-            .any(|(scaled, scale)| (scaled * scale - skipped_candle_return).abs() < 1e-12));
+        assert!(
+            !d.target_scaled_return
+                .iter()
+                .zip(&d.target_scales)
+                .any(|(scaled, scale)| (scaled * scale - skipped_candle_return).abs() < 1e-12)
+        );
     }
     #[test]
     fn pending_sigma_normalizes_following_return() {
@@ -666,7 +615,10 @@ mod tests {
         reversed.reverse();
         let out_of_order = build_dataset(&reversed);
         assert_eq!(ordered.target_timestamps, out_of_order.target_timestamps);
-        assert_eq!(ordered.target_scaled_return, out_of_order.target_scaled_return);
+        assert_eq!(
+            ordered.target_scaled_return,
+            out_of_order.target_scaled_return
+        );
     }
     #[test]
     fn version_invalidates_checkpoint() {
@@ -679,8 +631,8 @@ mod tests {
             equation: Some("x1".into()),
             prediction_mean: Some(0.0),
             prediction_std: Some(1.0),
-            feature_mean: Some(vec![0.0; N_FEATS]),
-            feature_std: Some(vec![1.0; N_FEATS]),
+            feature_min: Some(vec![0.0; N_FEATS]),
+            feature_max: Some(vec![1.0; N_FEATS]),
             rejection_reason: None,
             first_ts: data.first_ts,
             last_ts: data.last_ts,
@@ -700,8 +652,8 @@ mod tests {
             equation: Some("x1".into()),
             prediction_mean: Some(0.0),
             prediction_std: None,
-            feature_mean: Some(vec![0.0; N_FEATS]),
-            feature_std: Some(vec![1.0; N_FEATS]),
+            feature_min: Some(vec![0.0; N_FEATS]),
+            feature_max: Some(vec![1.0; N_FEATS]),
             rejection_reason: None,
             first_ts: data.first_ts,
             last_ts: data.last_ts,
@@ -742,8 +694,8 @@ mod tests {
             equation: None,
             prediction_mean: None,
             prediction_std: None,
-            feature_mean: None,
-            feature_std: None,
+            feature_min: None,
+            feature_max: None,
             n: 0,
             metrics: None,
             validation: None,

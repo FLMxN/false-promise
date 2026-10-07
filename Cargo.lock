@@ -1140,7 +1140,6 @@ name = "quant"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "chrono-tz",
  "env_logger",
  "log",
  "meval",
