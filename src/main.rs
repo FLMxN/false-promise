@@ -12,14 +12,14 @@ use yfinance_rs::{Interval, Range, Ticker, YfClient};
 
 const VOL_WINDOW: usize = 20;
 const FEATURE_WINDOW: usize = 5;
-const N_FEATS: usize = 8;
+const N_FEATS: usize = 11;
+const SCALE_FEATURE_INDEX: usize = 7;
 const K_BARS: usize = 1;
 const MIN_SIGMA: f64 = 1e-8;
 const MIN_PREDICTION_STD: f64 = 1e-12;
 const SOURCE_INTERVAL_HOURS: i64 = 1;
 
-const MODEL_VERSION: &str =
-    "2026-10-06/features-v5-hourly-minmax-relative-bh-turnover-robust-calibration-v7";
+const MODEL_VERSION: &str = "2026-10-08/features-v6-winsorized-context-features-hourly-y1-folds5-v10";
 
 #[derive(Deserialize, Debug)]
 struct Payload {
@@ -120,6 +120,7 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
     let mut prev_close = None;
     let mut volume_history = VecDeque::with_capacity(VOL_WINDOW);
     let mut feature_history = VecDeque::with_capacity(FEATURE_WINDOW);
+    let mut close_history = VecDeque::with_capacity(200);
 
     let mut pending: Option<(Vec<f64>, f64, f64)> = None;
     let mut last_features = vec![0.0; N_FEATS];
@@ -141,6 +142,7 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
             prev_close = None;
             volume_history.clear();
             feature_history.clear();
+            close_history.clear();
             continue;
         }
         if first_ts == 0 {
@@ -159,6 +161,11 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
                 target_timestamps.push(bar.ts);
             }
         }
+
+        if close_history.len() == 200 {
+            close_history.pop_front();
+        }
+        close_history.push_back(bar.close);
 
         if let Some(pc) = prev_close {
             if finite_positive(pc) {
@@ -187,14 +194,24 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
                             let sigma = (r.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
                                 / FEATURE_WINDOW as f64)
                                 .sqrt();
-                            let mut features = base;
-                            features.extend_from_slice(&[mean, sigma]);
-                            if all_finite(&features) && sigma >= MIN_SIGMA {
-                                last_features = features.clone();
-                                last_features_ts = Some(bar.ts);
-                                pending = Some((features, bar.close, sigma));
-                            } else if !all_finite(&features) {
-                                feature_history.clear();
+                            if close_history.len() == 200 {
+                                let mut features = base;
+                                features.extend_from_slice(&[mean, sigma]);
+                                let ma50 = close_history.iter().rev().take(50).sum::<f64>() / 50.0;
+                                let ma200 = close_history.iter().sum::<f64>() / 200.0;
+                                let hour = bar.ts.rem_euclid(86_400) as f64 / 3_600.0;
+                                features.extend_from_slice(&[
+                                    bar.close / ma50 - 1.0,
+                                    bar.close / ma200 - 1.0,
+                                    (std::f64::consts::TAU * hour / 24.0).sin(),
+                                ]);
+                                if all_finite(&features) && sigma >= MIN_SIGMA {
+                                    last_features = features.clone();
+                                    last_features_ts = Some(bar.ts);
+                                    pending = Some((features, bar.close, sigma));
+                                } else if !all_finite(&features) {
+                                    feature_history.clear();
+                                }
                             }
                         }
                     } else {
@@ -231,7 +248,7 @@ async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
     let client = YfClient::default();
     let ticker = Ticker::new(&client, token);
     let history = ticker
-        .history(Some(Range::Y1), Some(Interval::I1h), false)
+        .history(Some(Range::M3), Some(Interval::I1h), false)
         .await?;
     let now = Utc::now();
 
@@ -482,7 +499,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ctx = build_context(&data.last_features, minima, maxima);
         match meval::eval_str_with_context(equation, &ctx) {
             Ok(prediction) if prediction.is_finite() => {
-                let scale = data.last_features[N_FEATS - 1];
+                let scale = data.last_features[SCALE_FEATURE_INDEX];
                 let raw_return = prediction * scale;
                 let position = position_for(prediction, prediction_mean, prediction_std);
                 info!(
@@ -505,7 +522,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     fn bars() -> Vec<Bar> {
-        (0..16)
+        (0..256)
             .map(|i| {
                 let o = 100.0 + i as f64;
                 Bar {
@@ -529,7 +546,7 @@ mod tests {
     fn hourly_bars_are_used_without_aggregation() {
         let data = build_dataset(&bars());
 
-        assert_eq!(data.x.len(), bars().len() - FEATURE_WINDOW - 1);
+        assert_eq!(data.x.len(), bars().len() - 200);
         assert!(
             data.target_timestamps
                 .windows(2)
@@ -551,6 +568,13 @@ mod tests {
         assert!(d.x.iter().all(|r| r.len() == N_FEATS && all_finite(r)));
         assert_eq!(d.x.len(), d.target_scales.len());
         assert_eq!(d.x.len(), d.target_timestamps.len());
+        assert!((d.x[0][SCALE_FEATURE_INDEX] - d.target_scales[0]).abs() < 1e-12);
+        let b = bars();
+        let ma50 = b[150..200].iter().map(|bar| bar.close).sum::<f64>() / 50.0;
+        let ma200 = b[..200].iter().map(|bar| bar.close).sum::<f64>() / 200.0;
+        assert!((d.x[0][8] - (b[199].close / ma50 - 1.0)).abs() < 1e-12);
+        assert!((d.x[0][9] - (b[199].close / ma200 - 1.0)).abs() < 1e-12);
+        assert!((d.x[0][10] - (std::f64::consts::TAU / 3.0).sin()).abs() < 1e-12);
     }
     #[test]
     fn zero_target_on_last_candle_is_dropped() {
@@ -567,7 +591,7 @@ mod tests {
     #[test]
     fn invalid_candle_breaks_target_alignment() {
         let mut b = bars();
-        b.extend((16..36).map(|i| {
+        b.extend((256..276).map(|i| {
             let o = 100.0 + i as f64;
             Bar {
                 ts: (i + 1) * 3600,
@@ -578,10 +602,10 @@ mod tests {
                 volume: 1000.0 + i as f64,
             }
         }));
-        b[18].close = f64::NAN;
+        b[210].close = f64::NAN;
 
         let d = build_dataset(&b);
-        let skipped_candle_return = (b[19].close - b[17].close) / b[17].close;
+        let skipped_candle_return = (b[211].close - b[209].close) / b[209].close;
         assert!(
             !d.target_scaled_return
                 .iter()
@@ -593,7 +617,7 @@ mod tests {
     fn pending_sigma_normalizes_following_return() {
         let d = build_dataset(&bars());
         let b = bars();
-        let raw = (b[6].close - b[5].close) / b[5].close;
+        let raw = (b[200].close - b[199].close) / b[199].close;
         assert!((d.target_scaled_return[0] * d.target_scales[0] - raw).abs() < 1e-12);
     }
     #[test]
