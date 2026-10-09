@@ -105,7 +105,7 @@ fn position_for(prediction: f64, calibration_mean: f64, calibration_std: f64) ->
 }
 
 fn is_crypto_symbol(token: &str) -> bool {
-    token == "BTC" || token == "ETH" || token.ends_with("-USD") || token.ends_with("-USDT")
+    token.ends_with("-USD") || token.ends_with("-USDT")
 }
 
 fn build_dataset(bars: &[Bar]) -> Dataset {
@@ -245,11 +245,24 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
 
 #[tokio::main]
 async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
-    info!("Fetching data for {}", token);
+    debug!("Fetching data for {}", token);
     let client = YfClient::default();
     let ticker = Ticker::new(&client, token);
+    let quote = ticker.quote().await?;
+    let range = if is_crypto_symbol(token) {
+        Range::M1
+    } else {
+        Range::M3};
+
+    info!(
+        "Is crypto: {}", is_crypto_symbol(token)
+    );
+    if let Some(price) = quote.price.as_ref() {
+        info!("Latest price for {}: {}", token, price);
+    }
+
     let history = ticker
-        .history(Some(Range::M3), Some(Interval::I1h), false)
+        .history(Some(range), Some(Interval::I1h), false)
         .await?;
     let now = Utc::now();
 
@@ -287,6 +300,7 @@ async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
 }
 
 fn run(
+    mode: &str,
     x: &[Vec<f64>],
     y: &[f64],
     scales: &[f64],
@@ -296,6 +310,7 @@ fn run(
 ) -> std::io::Result<String> {
     info!("Running Julia model with {} samples", x.len());
     let body = serde_json::json!({
+        "mode": mode,
         "features": x,
         "target_scaled_return": y,
         "target_scales": scales,
@@ -386,9 +401,18 @@ fn build_context(features: &[f64], minima: &[f64], maxima: &[f64]) -> meval::Con
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+    let default = if env::args().any(|arg| arg == "--debug") {
+        "debug"
+    } else {
+        "info"
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default)).init();
     info!("Starting pipeline");
     for token in env::args().skip(1) {
+        if token == "--debug" {
+            continue;
+        }
+
         info!("Processing token: {}", token);
         let data = fetch(&token)?;
         if data.x.len() < 50 {
@@ -444,6 +468,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let julia = env::var("JULIA_PATH").unwrap_or_else(|_| "julia".into());
             debug!("Julia path: {}", julia);
             serde_json::from_str(&run(
+                default,
                 &data.x,
                 &data.target_scaled_return,
                 &data.target_scales,

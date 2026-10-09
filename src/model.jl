@@ -21,7 +21,7 @@ Logging.catch_exceptions(logger::WarningFilterLogger) =
 Logging.handle_message(logger::WarningFilterLogger, args...; kwargs...) =
     Logging.handle_message(logger.logger, args...; kwargs...)
 
-const logger = WarningFilterLogger(ConsoleLogger(stderr, Logging.Debug))
+const logger = WarningFilterLogger(ConsoleLogger(stderr, Logging.Info))
 global_logger(logger)
 
 const BUDGET = 600
@@ -346,10 +346,6 @@ function batch_aligned_returns(dataset, y_raw)
     return isnothing(batch_indices) ? y_raw : y_raw[batch_indices]
 end
 
-"""
-Optimize predictions in σ-scaled units (`dataset.y`); `y_raw` supplies raw
-returns for portfolio-return, turnover, and Sharpe-related calculations.
-"""
 function training_loss(tree, dataset, options, y_raw; alpha, beta, beta2, gamma,
                        directional_weight = DIRECTIONAL_PENALTY_WEIGHT)
     prediction, completed = try
@@ -458,10 +454,6 @@ function fit_best_model(X_fit, y_fit_scaled, y_fit_raw)
     return machine_model, best_idx, feature_min, feature_max
 end
 
-"""
-Fit and calibrate with σ-scaled labels/predictions. Raw returns are used for
-portfolio backtesting, including returns, turnover, and Sharpe calculations.
-"""
 function fit_and_evaluate(X_train, y_train_scaled, y_train_raw, X_valid,
                           y_valid_scaled, y_valid_raw, annual_periods)
     length(y_train_scaled) == length(y_train_raw) ||
@@ -618,7 +610,7 @@ function log_fold_metrics(metric)
     equation = hasproperty(metric, :equation) ? metric.equation : nothing
     shuffle_sharpe = hasproperty(metric, :shuffle_sharpe) ? metric.shuffle_sharpe : nothing
     @info "Fold $(metric.fold) equation: $(equation === nothing ? "unavailable" : equation)"
-    @info "Fold $(metric.fold): buy_hold_sharpe=$(format_metric(metric.buy_hold_sharpe)), strategy_sharpe=$(format_metric(metric.strategy_sharpe))+$(MIN_RETURN), shuffle_sharpe=$(format_metric(shuffle_sharpe))+$(MIN_RETURN), hac_t_stat=$(format_metric(metric.t_stat)), turnover=$(format_metric(metric.turnover))"
+    @info "Fold $(metric.fold): buy_hold_sharpe=$(format_metric(metric.buy_hold_sharpe)), strategy_sharpe=$(format_metric(metric.strategy_sharpe))+$(MIN_RETURN), shuffle_sharpe=$(format_metric(shuffle_sharpe)), hac_t_stat=$(format_metric(metric.t_stat)), turnover=$(format_metric(metric.turnover))"
 end
 
 function fold_metrics_valid(metric)
@@ -764,7 +756,6 @@ function discover(X, y_scaled, raw_returns; is_crypto = false, k_bars = 1)
     @info "Final split: train=1:$(final_train_end), embargo=$(k_bars), " *
         "holdout=$(holdout_start):$(holdout_end) ($(effective_holdout_size) samples)"
 
-    @info "Starting walk-forward validation (n_max=$(final_train_end))"
     fold_metrics = walk_forward(
         X, y_scaled, raw_returns;
         annual_periods,
@@ -804,7 +795,7 @@ function discover(X, y_scaled, raw_returns; is_crypto = false, k_bars = 1)
         return rejected("final holdout evaluation failed"; validation)
     end
 
-    @info "Holdout ($(holdout.sample_count) samples, annualization=$(round(annual_periods, digits=1))/year): strategy_return=$(format_metric(holdout.strategy_return))+$(MIN_RETURN), buy_hold_return=$(format_metric(holdout.buy_hold_return)), strategy_sharpe=$(format_metric(holdout.strategy_sharpe))+$(MIN_RETURN), buy_hold_sharpe=$(format_metric(holdout.buy_hold_sharpe)), HAC_t=$(format_metric(holdout.t_stat)), turnover=$(format_metric(holdout.turnover))"
+    @info "Holdout ($(holdout.sample_count) samples, annualization=$(round(annual_periods, digits=1))/year): strategy_return=$(format_metric(holdout.strategy_return)), buy_hold_return=$(format_metric(holdout.buy_hold_return)), strategy_sharpe=$(format_metric(holdout.strategy_sharpe)), buy_hold_sharpe=$(format_metric(holdout.buy_hold_sharpe)), HAC_t=$(format_metric(holdout.t_stat)), turnover=$(format_metric(holdout.turnover))"
 
     if !fold_metrics_valid(holdout)
         @warn "Final holdout metrics are numerically invalid: $(holdout.invalid_reason)"
@@ -853,15 +844,23 @@ function valid_input(rows, y, scales, timestamps)
 end
 
 function main(io = stdin)
-    @info "Starting Julia model execution"
     payload = JSON3.read(read(io, String))
-    @debug "Received payload with features count: $(length(payload.features))"
-
     rows = [Float32.(collect(row)) for row in payload.features]
+    mode = String(get(payload, :mode, "info"))
     y_scaled = Float32.(payload.target_scaled_return)
     scales = Float64.(payload.target_scales)
     timestamps = Int64.(get(payload, :target_timestamps, Int64[]))
     is_crypto = Bool(get(payload, :is_crypto, false))
+
+    if mode == "debug"
+        logger = WarningFilterLogger(ConsoleLogger(stderr, Logging.Debug))
+    else
+        logger = WarningFilterLogger(ConsoleLogger(stderr, Logging.Info))
+    end
+    global_logger(logger)
+
+    @info "Starting Julia model execution"
+    @debug "Received payload with features count: $(length(payload.features))"
 
     @info "Processing $(length(rows)) samples"
 
@@ -870,7 +869,6 @@ function main(io = stdin)
         JSON3.write(stdout, rejected("invalid or insufficient feature/target data"))
     else
         @info "Input validated, starting discovery"
-        # Reconstruct raw returns from the σ-scaled target for portfolio simulation.
         raw_returns = Float32.(Float64.(y_scaled) .* scales)
         result = discover(rows_to_matrix(rows), y_scaled, raw_returns; is_crypto,
                           k_bars = Int(get(payload, :k_bars, 1)))
@@ -883,6 +881,7 @@ function main(io = stdin)
 end
 
 function selftest()
+    global_logger(logger)
     @assert !Logging.shouldlog(logger, Logging.Warn, @__MODULE__, :test, :warning)
     @assert Logging.shouldlog(logger, Logging.Info, @__MODULE__, :test, :info)
 
