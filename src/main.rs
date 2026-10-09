@@ -19,7 +19,7 @@ const MIN_SIGMA: f64 = 1e-8;
 const MIN_PREDICTION_STD: f64 = 1e-12;
 const SOURCE_INTERVAL_HOURS: i64 = 1;
 
-const MODEL_VERSION: &str = "2026-10-08/features-v6-winsorized-context-features-hourly-y1-folds5-v10";
+const MODEL_VERSION: &str = "2026-10-08/features-v6-winsorized-context-features-hourly-y1-folds5-v10-hac-sample-gate";
 
 #[derive(Deserialize, Debug)]
 struct Payload {
@@ -188,13 +188,15 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
                         if feature_history.len() > FEATURE_WINDOW {
                             feature_history.pop_front();
                         }
-                        if feature_history.len() == FEATURE_WINDOW {
-                            let r: Vec<f64> = feature_history.iter().map(|f| f[0]).collect();
-                            let mean = r.iter().sum::<f64>() / FEATURE_WINDOW as f64;
-                            let sigma = (r.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
-                                / FEATURE_WINDOW as f64)
-                                .sqrt();
                             if close_history.len() == 200 {
+                                let recent: Vec<f64> = close_history.iter().rev()
+                                    .take(FEATURE_WINDOW + 1).copied().collect();
+                                let rets: Vec<f64> = (0..FEATURE_WINDOW)
+                                    .map(|i| (recent[i] - recent[i + 1]) / recent[i + 1])
+                                    .collect();
+                                let mean = rets.iter().sum::<f64>() / FEATURE_WINDOW as f64;
+                                let sigma = (rets.iter().map(|v| (v - mean).powi(2))
+                                    .sum::<f64>() / FEATURE_WINDOW as f64).sqrt();
                                 let mut features = base;
                                 features.extend_from_slice(&[mean, sigma]);
                                 let ma50 = close_history.iter().rev().take(50).sum::<f64>() / 50.0;
@@ -213,7 +215,6 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
                                     feature_history.clear();
                                 }
                             }
-                        }
                     } else {
                         feature_history.clear();
                     }
@@ -377,6 +378,10 @@ fn build_context(features: &[f64], minima: &[f64], maxima: &[f64]) -> meval::Con
     ctx.func("tanh", |x| x.tanh());
     ctx.func("square", |x| x * x);
     ctx.func("relu", |x| if x > 0.0 { x } else { 0.0 });
+    ctx.func("cube", |x| x * x * x);
+    ctx.func("cbrt", |x| x.cbrt());
+    ctx.func("abs", |x| x.abs());
+    ctx.func("softplus", |x| (1.0 + x.exp()).ln());
     ctx
 }
 
