@@ -62,7 +62,14 @@ function rows_to_matrix(rows)
     return reduce(vcat, transpose.(rows))
 end
 
-periods_per_year(is_crypto) = is_crypto ? 365 * 24 : 252 * 6.5
+function periods_per_year(asset_type::AbstractString)
+    asset_type == "futures" && return 252 * 23 * 4
+    asset_type == "currency" && return 252 * 24 * 2
+    asset_type == "crypto" && return 365 * 24
+    asset_type == "index" && return 252 * 6.5 / 4
+    asset_type == "stock" && return 252 * 6.5
+    throw(ArgumentError("Unsupported asset type for annualization: $asset_type"))
+end
 
 function invalid_metrics(sample_count, reason)
     return (
@@ -489,9 +496,14 @@ end
 function shuffle_control(X_train, y_train_scaled, y_train_raw, X_valid,
                          y_valid_raw, annual_periods)
     shuffle_rng = MersenneTwister(666)
-    shuffled = y_train_scaled[randperm(shuffle_rng, length(y_train_scaled))]
+    perm = randperm(shuffle_rng, length(y_train_scaled))
+
+    shuffled_scaled = y_train_scaled[perm]
+    shuffled_raw = y_train_raw[perm]
+
     machine_model, _, feature_min, feature_max =
-        fit_best_model(X_train, shuffled, y_train_raw)
+        fit_best_model(X_train, shuffled_scaled, shuffled_raw)
+
     X_train_normalized = scale_features(X_train, feature_min, feature_max)
     training_prediction = predict(machine_model, X_train_normalized)
     minimum_scale = minimum_calibration_scale(y_train_scaled)
@@ -500,8 +512,10 @@ function shuffle_control(X_train, y_train_scaled, y_train_raw, X_valid,
     calibration_mean, calibration_std = calibration_parameters(
         training_prediction; minimum_scale,
     )
+    
     X_valid_normalized = scale_features(X_valid, feature_min, feature_max)
     validation_prediction = predict(machine_model, X_valid_normalized)
+
     return backtest_metrics(
         y_valid_raw, validation_prediction, calibration_mean, calibration_std;
         annual_periods,
@@ -732,9 +746,9 @@ function rejected(reason; validation = nothing)
             validation = validation, reason = reason)
 end
 
-function discover(X, y_scaled, raw_returns; is_crypto = false, k_bars = 1)
+function discover(X, y_scaled, raw_returns; asset_type = "stock", k_bars = 1)
     n_total = size(X, 1)
-    annual_periods = periods_per_year(is_crypto)
+    annual_periods = periods_per_year(asset_type)
 
     if n_total - MIN_TRAIN_SAMPLES < 5
         @warn "Not enough samples beyond MIN_TRAIN_SAMPLES=$(MIN_TRAIN_SAMPLES): n=$(n_total)"
@@ -850,7 +864,11 @@ function main(io = stdin)
     y_scaled = Float32.(payload.target_scaled_return)
     scales = Float64.(payload.target_scales)
     timestamps = Int64.(get(payload, :target_timestamps, Int64[]))
-    is_crypto = Bool(get(payload, :is_crypto, false))
+    asset_type = String(get(
+        payload,
+        :asset_type,
+        Bool(get(payload, :is_crypto, false)) ? "crypto" : "stock",
+    ))
 
     if mode == "debug"
         logger = WarningFilterLogger(ConsoleLogger(stderr, Logging.Debug))
@@ -870,7 +888,7 @@ function main(io = stdin)
     else
         @info "Input validated, starting discovery"
         raw_returns = Float32.(Float64.(y_scaled) .* scales)
-        result = discover(rows_to_matrix(rows), y_scaled, raw_returns; is_crypto,
+        result = discover(rows_to_matrix(rows), y_scaled, raw_returns; asset_type,
                           k_bars = Int(get(payload, :k_bars, 1)))
         @info "Discovery complete, status: $(result.status)"
         JSON3.write(stdout, result)
@@ -887,9 +905,12 @@ function selftest()
 
     raw_returns = [0.01, -0.01]
     prediction = [1.0, -1.0]
-    annual_periods = periods_per_year(false)
+    annual_periods = periods_per_year("stock")
     @assert annual_periods == 252 * 6.5
-    @assert periods_per_year(true) == 365 * 24
+    @assert periods_per_year("futures") == 252 * 23 * 4
+    @assert periods_per_year("currency") == 252 * 24 * 2
+    @assert periods_per_year("crypto") == 365 * 24
+    @assert periods_per_year("index") == 252 * 6.5 / 4
     @assert sharpe_ratio(ones(4), annual_periods) === nothing
 
     objective_returns = [0.1, -0.05, 0.02, -0.01]

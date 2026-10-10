@@ -1,24 +1,32 @@
 # False Promise
 
-Experimental hourly market forecasting research project built from a Rust data pipeline and a Julia symbolic-regression training loop. It is intentionally research-oriented and not production trading software.
+Experimental market forecasting research project built from a Rust data pipeline and a Julia symbolic-regression training loop. It is intentionally research-oriented and not production trading software.
 
 ## Current codebase at a glance
 
 The project is split into two main parts:
 
-- `src/main.rs`: fetches Yahoo Finance hourly candles, validates them, builds aligned feature and target rows, runs Julia, reuses checkpoints, and performs live inference.
+- `src/main.rs`: fetches Yahoo Finance candles at an asset-specific interval, validates them, builds aligned feature and target rows, runs Julia, reuses checkpoints, and performs live inference.
 - `src/model.jl`: fits symbolic-regression expressions, performs walk-forward validation, computes calibration statistics, and backtests the resulting strategy.
 - `checkpoints/*.json`: cached model snapshots for each ticker.
 
 The active model version in the Rust code is:
 
 ```text
-2026-10-08/features-v6-winsorized-context-features-hourly-y1-folds5-v10-hac-sample-gate
+2026-10-08/features-v6-winsorized-context-features-hourly-y1-folds5-v10-hac-sample-gate-asset-annualization-v1
 ```
 
 ## Data contract and feature pipeline
 
-Rust does not train on raw OHLCV rows. It fetches hourly Yahoo candles, filters invalid bars, and builds one delayed training row per valid completed candle.
+Rust does not train on raw OHLCV rows. It selects a Yahoo candle interval by asset type, filters invalid bars, and builds one delayed training row per valid completed candle:
+
+| Asset type | Symbol marker | Candle interval |
+|---|---|---:|
+| Futures | `=F` | 10 minutes |
+| Currency | `=X` | 30 minutes |
+| Crypto | `-` | 1 hour |
+| Index | `^` | 4 hours |
+| Stock | default | 1 hour |
 
 ```text
 X(T) = features(previous valid candle)
@@ -26,9 +34,9 @@ target_return(T) = (Close(T) - Close(previous valid candle)) / Close(previous va
 target_scaled_return(T) = target_return(T) / sigma(previous valid candle)
 ```
 
-This is a next-observed-hourly-candle close-to-close forecast. The feature vector is anchored to the preceding valid candle and the target is realized on the next valid bar.
+This is a next-observed-candle close-to-close forecast. The feature vector is anchored to the preceding valid candle and the target is realized on the next valid bar.
 
-The current code builds 11 engineered features from the completed hourly candle:
+The current code builds 11 engineered features from the completed candle:
 
 1. close/open return
 2. gap from preceding close to open
@@ -42,13 +50,13 @@ The current code builds 11 engineered features from the completed hourly candle:
 10. close relative to its 200-candle moving average
 11. UTC hour-of-day phase encoded as `sin(2π * hour / 24)`
 
-Rows with insufficient history, invalid values, non-positive prices, non-finite values, or bad volume are discarded. The code keeps only the most recent valid completed hourly candle as the live feature vector (`last_features` / `last_features_ts`).
+Rows with insufficient history, invalid values, non-positive prices, non-finite values, or bad volume are discarded. The code keeps only the most recent valid completed candle as the live feature vector (`last_features` / `last_features_ts`).
 
 ## Pipeline behavior
 
 The current Rust pipeline does the following:
 
-1. Fetches recent hourly history via `yfinance-rs`.
+1. Fetches recent history via `yfinance-rs` at the asset-specific interval.
 2. Validates each bar (`open/high/low/close/volume`, monotonicity, positive values, etc.).
 3. Builds a dataset of delayed features and sigma-scaled targets.
 4. Passes the dataset into Julia for symbolic regression.
@@ -83,6 +91,7 @@ The Julia model uses symbolic regression with a restricted operator set and a wa
 - transaction cost rate `COST_RATE = 0.0005`
 - minimum calibration scale floor and signed return handling
 - training and validation metrics based on compounded net returns, Sharpe, Sortino, max drawdown, and turnover
+- annualization matched to the Rust asset class: futures use 10-minute bars across a 23-hour weekday session, currencies use 30-minute bars across 24-hour weekdays, crypto uses 24/7 hourly bars, indices use 4-hour bars during 6.5-hour sessions, and stocks use hourly bars during 6.5-hour sessions
 
 The optimization uses a cost-sensitive objective, complexity penalties, and chronological validation folds before accepting a final equation.
 

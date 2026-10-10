@@ -17,9 +17,8 @@ const SCALE_FEATURE_INDEX: usize = 7;
 const K_BARS: usize = 1;
 const MIN_SIGMA: f64 = 1e-8;
 const MIN_PREDICTION_STD: f64 = 1e-12;
-const SOURCE_INTERVAL_HOURS: i64 = 1;
 
-const MODEL_VERSION: &str = "2026-10-08/features-v6-winsorized-context-features-hourly-y1-folds5-v10-hac-sample-gate";
+const MODEL_VERSION: &str = "2026-10-08/features-v6-winsorized-context-features-hourly-y1-folds5-v10-hac-sample-gate-asset-annualization-v1";
 
 #[derive(Deserialize, Debug)]
 struct Payload {
@@ -104,8 +103,43 @@ fn position_for(prediction: f64, calibration_mean: f64, calibration_std: f64) ->
     ((prediction - calibration_mean) / calibration_std).tanh()
 }
 
-fn is_crypto_symbol(token: &str) -> bool {
-    token.ends_with("-USD") || token.ends_with("-USDT")
+fn asset_type(token: &str) -> &'static str {
+    match token {
+        name if name.contains("=F") => "futures",
+        name if name.contains("=X") => "currency",
+        name if name.ends_with("-USD") || name.ends_with("-USDT") => "crypto",
+        name if name.contains("^") => "index",
+        _ => "stock",
+    }
+}
+
+fn asset_range(token: &str) -> Range {
+    match asset_type(token) {
+        "futures" => Range::D5,
+        "currency" => Range::M1,
+        "crypto" => Range::M3,
+        "index" => Range::Y1,
+        _ => Range::M6,
+    }
+}
+
+fn asset_interval(token: &str) -> Interval {
+    match asset_type(token) {
+        "futures" => Interval::I15m,
+        "currency" => Interval::I30m,
+        "crypto" => Interval::I1h,
+        "index" => Interval::I4h,
+        _ => Interval::I1h,
+    }
+}
+
+fn asset_interval_duration(token: &str) -> Duration {
+    match asset_type(token) {
+        "futures" => Duration::minutes(15),
+        "currency" => Duration::minutes(30),
+        "index" => Duration::hours(4),
+        _ => Duration::hours(1),
+    }
 }
 
 fn build_dataset(bars: &[Bar]) -> Dataset {
@@ -249,27 +283,25 @@ async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
     let client = YfClient::default();
     let ticker = Ticker::new(&client, token);
     let quote = ticker.quote().await?;
-    let range = if is_crypto_symbol(token) {
-        Range::M1
-    } else {
-        Range::M3};
-
     info!(
-        "Is crypto: {}", is_crypto_symbol(token)
+        "Range: {}", asset_range(token)
+    );
+    info!(
+        "Interval: {}", asset_interval(token)
     );
     if let Some(price) = quote.price.as_ref() {
         info!("Latest price for {}: {}", token, price);
     }
 
     let history = ticker
-        .history(Some(range), Some(Interval::I1h), false)
+        .history(Some(asset_range(token)), Some(asset_interval(token)), false)
         .await?;
     let now = Utc::now();
 
-    let hourly_bars = history
+    let candle_bars = history
         .into_iter()
         .filter_map(|c| {
-            if c.ts + Duration::hours(SOURCE_INTERVAL_HOURS) > now {
+            if c.ts + asset_interval_duration(token) > now {
                 return None;
             };
             Some(Bar {
@@ -286,11 +318,12 @@ async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
         })
         .collect::<Vec<_>>();
     debug!(
-        "Fetched {} completed hourly bars for {}",
-        hourly_bars.len(),
+        "Fetched {} completed {} bars for {}",
+        candle_bars.len(),
+        asset_interval(token),
         token
     );
-    let dataset = build_dataset(&hourly_bars);
+    let dataset = build_dataset(&candle_bars);
     debug!(
         "Built dataset with {} samples for {}",
         dataset.x.len(),
@@ -305,7 +338,7 @@ fn run(
     y: &[f64],
     scales: &[f64],
     timestamps: &[i64],
-    is_crypto: bool,
+    asset_type: &str,
     path: &str,
 ) -> std::io::Result<String> {
     info!("Running Julia model with {} samples", x.len());
@@ -316,7 +349,7 @@ fn run(
         "target_scales": scales,
         "target_timestamps": timestamps,
         "k_bars": K_BARS,
-        "is_crypto": is_crypto
+        "asset_type": asset_type
     });
     debug!(
         "Julia input: features={}, targets={}, scales={}, timestamps={}",
@@ -417,7 +450,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let data = fetch(&token)?;
         if data.x.len() < 50 {
             warn!(
-                "{}: insufficient valid completed hourly history ({} samples)",
+                "{}: insufficient valid completed history ({} samples)",
                 token,
                 data.x.len()
             );
@@ -473,7 +506,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &data.target_scaled_return,
                 &data.target_scales,
                 &data.target_timestamps,
-                is_crypto_symbol(&token),
+                asset_type(&token),
                 &julia,
             )?)?
         };
@@ -537,7 +570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     token, prediction, raw_return, position
                 );
                 println!(
-                    "predicted close-to-close return for next hourly candle of {token}: {raw_return}; position: {position}"
+                    "predicted close-to-close return for next candle of {token}: {raw_return}; position: {position}"
                 );
             }
             Ok(_) => warn!("Non-finite equation result for {}", token),
@@ -582,6 +615,23 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[1] - pair[0] == Duration::hours(1).num_seconds())
         );
+    }
+    #[test]
+    fn asset_type_and_interval_duration_match_source_intervals() {
+        assert_eq!(asset_type("ES=F"), "futures");
+        assert_eq!(asset_type("EURUSD=X"), "currency");
+        assert_eq!(asset_type("BTC-USD"), "crypto");
+        assert_eq!(asset_type("ETH-USDT"), "crypto");
+        assert_eq!(asset_type("^GSPC"), "index");
+        assert_eq!(asset_type("AAPL"), "stock");
+        assert_eq!(asset_type("BRK-B"), "stock");
+
+        assert_eq!(asset_interval_duration("ES=F"), Duration::minutes(15));
+        assert_eq!(asset_interval_duration("EURUSD=X"), Duration::minutes(30));
+        assert_eq!(asset_interval_duration("BTC-USD"), Duration::hours(1));
+        assert_eq!(asset_interval_duration("BRK-B"), Duration::hours(1));
+        assert_eq!(asset_interval_duration("^GSPC"), Duration::hours(4));
+        assert_eq!(asset_interval_duration("AAPL"), Duration::hours(1));
     }
     #[test]
     fn inference_context_applies_training_minmax_and_clamps() {
