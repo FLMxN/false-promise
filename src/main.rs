@@ -22,6 +22,7 @@ const MODEL_VERSION: &str = "2026-10-08/features-v6-winsorized-context-features-
 
 #[derive(Deserialize, Debug)]
 struct Payload {
+    #[serde(default)]
     status: String,
     equation: Option<String>,
     #[serde(default)]
@@ -32,6 +33,7 @@ struct Payload {
     feature_min: Option<Vec<f64>>,
     #[serde(default)]
     feature_max: Option<Vec<f64>>,
+    #[serde(default)]
     n: usize,
     #[serde(default)]
     metrics: Option<Metrics>,
@@ -40,13 +42,14 @@ struct Payload {
     #[serde(default)]
     reason: Option<String>,
 }
+
 #[derive(Deserialize, Debug, Serialize, Clone)]
 struct Metrics {
-    sharpe: f64,
+    sharpe: Option<f64>,
     sortino: Option<f64>,
-    max_drawdown: f64,
-    turnover: f64,
-    total_return: f64,
+    max_drawdown: Option<f64>,
+    turnover: Option<f64>,
+    total_return: Option<f64>,
 }
 #[derive(Debug, Deserialize, Serialize)]
 struct Checkpoint {
@@ -361,7 +364,7 @@ fn run(
     let mut child = Command::new(path)
         .arg("-t")
         .arg("auto")
-        .arg("src/model.jl")
+        .arg("src/engine.jl")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -479,7 +482,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        let payload = if cache_valid {
+        let mut payload = if cache_valid {
             let c = old.as_ref().unwrap();
             debug!(
                 "Loading cached model: status={}, equation={:?}",
@@ -510,10 +513,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &julia,
             )?)?
         };
+        if payload.status == "ok" {
+            payload.status = "accepted".into();
+        }
+
         info!(
             "Model result: token={} status={} samples={} reason={:?}",
             token, payload.status, payload.n, payload.reason
         );
+
         let checkpoint = Checkpoint {
             model_version: MODEL_VERSION.into(),
             history: data.target_scaled_return.clone(),
@@ -542,6 +550,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .equation
             .as_deref()
             .ok_or("accepted model without equation")?;
+        let metrics = payload
+            .metrics.unwrap_or_else( || {
+                Metrics {
+                    sharpe: Some(0.0),
+                    sortino: Some(0.0),
+                    max_drawdown: Some(0.0),
+                    turnover: Some(0.0),
+                    total_return: Some(0.0)
+                }
+            }
+            );
         let prediction_mean = payload
             .prediction_mean
             .filter(|v| v.is_finite())
@@ -565,13 +584,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let scale = data.last_features[SCALE_FEATURE_INDEX];
                 let raw_return = prediction * scale;
                 let position = position_for(prediction, prediction_mean, prediction_std);
+                info!("Equation: {equation}");
                 info!(
-                    "Prediction for {}: scaled={}, raw_return={}, position={}",
-                    token, prediction, raw_return, position
+                    "Prediction for {}: position={}, scaled_return={}, raw_return={}",
+                    token, position, prediction, raw_return
                 );
-                println!(
-                    "predicted close-to-close return for next candle of {token}: {raw_return}; position: {position}"
-                );
+                info!("Sharpe: {:#?}", metrics.sharpe.unwrap_or_else(|| 0.0))
+
             }
             Ok(_) => warn!("Non-finite equation result for {}", token),
             Err(e) => error!("Evaluation error for {}: {}", token, e),
