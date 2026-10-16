@@ -427,7 +427,7 @@ fn build_context(features: &[f64], minima: &[f64], maxima: &[f64]) -> meval::Con
 
     ctx.func("sqrt", |x| x.sqrt());
     ctx.func("tanh", |x| x.tanh());
-    ctx.func("square", |x| x * x);
+    ctx.func("sqr", |x| x * x);
     ctx.func("relu", |x| if x > 0.0 { x } else { 0.0 });
     ctx.func("cube", |x| x * x * x);
     ctx.func("cbrt", |x| x.cbrt());

@@ -6,7 +6,7 @@ export fbounds, fscale, matrix, aperiods, sqr, relu, cube, softplus, sharpe, SR_
 
 const MIN_PREDICTION_STD = 1e-12
 const N_FEATURES = 11
-const BUDGET = 120
+const BUDGET = 1000
 
 sqr(x) = x * x
 relu(x) = x > 0.0 ? x : 0.0
@@ -18,14 +18,16 @@ const SR_OPTIONS = Options(
     population_size = max(1, Threads.nthreads()),
     ncycles_per_iteration = Int(BUDGET / 10),
     tournament_selection_n = max(1, Threads.nthreads() - 1),
-    binary_operators = [+, -, *, /],
-    unary_operators = [sqr, cube, sqrt, cbrt, tanh, abs, softplus],
+    binary_operators = [+, -, *],
+    unary_operators = [sqrt, cbrt, tanh, abs, softplus],
+    maxsize = 20,
+    maxdepth = 6,
     complexity_of_operators = Dict(
         (+) => 1, (-) => 1, (*) => 1, (/) => 1,
-        sqrt => 1, sqr => 2, tanh => 1, abs => 1,
-        cbrt => 1, cube => 2, softplus => 1
+        sqrt => 1, sqr => 3, tanh => 1, abs => 1,
+        cbrt => 1, cube => 3, softplus => 1
     ),
-    parsimony = 0.0,
+    parsimony = 1e-2,
     should_optimize_constants = false,
     batching = true,
     batch_size = 256,

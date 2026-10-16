@@ -38,7 +38,7 @@ function discover(X, y, asset_type)
             niterations = BUDGET,
             options = SR_OPTIONS,
             parallelism = :multithreading,
-            verbosity = 0
+            verbosity = 1
         )
     end
     return hof, Xp, feature_min, feature_max
