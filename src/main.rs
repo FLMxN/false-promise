@@ -10,6 +10,9 @@ use std::{
 };
 use yfinance_rs::{Interval, Range, Ticker, YfClient};
 
+mod diff;
+use crate::diff::{grad, lead};
+
 const VOL_WINDOW: usize = 20;
 const FEATURE_WINDOW: usize = 5;
 const N_FEATS: usize = 11;
@@ -587,9 +590,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Equation: {equation}");
                 info!(
                     "Prediction for {}: position={}, scaled_return={}, raw_return={}",
-                    token, position, prediction, raw_return
+                    token, (position*10000.0).round()/10000.0, (prediction*10000.0).round()/10000.0, (raw_return*10000.0).round()/10000.0
                 );
-                info!("Sharpe: {:#?}", metrics.sharpe.unwrap_or_else(|| 0.0))
+                info!("Sharpe: {:#?}", metrics.sharpe.unwrap_or_else(|| 0.0));
+                match grad(equation, &data.last_features, minima, maxima) {
+                    Ok(g) => {
+                        let loco = lead(g.clone());
+                        let det = match loco.1 {
+                            _ if loco.1 < 0.5 => "low",
+                            _ if loco.1 > 0.9 => "high",
+                            _ => "mid"
+                        };
+                        info!("Gradient (∂f/∂x_scaled): {:?}", g);
+                        info!("Leading variable: x{} ({}%); determination: {}", loco.0, ((loco.1)*100.0).round(), det)
+                    },
+                    Err(e) => warn!("Gradient computation failed: {e}"),
+                }
 
             }
             Ok(_) => warn!("Non-finite equation result for {}", token),
