@@ -1,122 +1,129 @@
-# False Promise § <br />Quant finance research pipeline, powered by Rust and Julia
+# False Promise
 
-## Introduction
-Experimental market forecasting research project built from a Rust data pipeline and a Julia symbolic-regression training loop, powered by open Yahoo Finance data.
+An experimental market-research pipeline built with Rust and Julia. It downloads market candles from Yahoo Finance, trains a symbolic-regression model, and evaluates that model on the latest completed candle.
 
-### License
-Apache 2.0
+> [!WARNING]
+> This is experimental research software, not a trading system or financial advice. Market data and model outputs may be incomplete or incorrect. Do not make financial decisions based solely on this program.
 
-## Overview
+## How it works
 
-The project is split into two main parts:
+For each ticker, the Rust application:
 
-- `src/main.rs`: fetches Yahoo Finance candles at an asset-specific interval, validates them, builds aligned feature and target rows, runs Julia, reuses checkpoints, and performs live inference.
-- `src/model.jl`: fits symbolic-regression expressions, performs walk-forward validation, computes calibration statistics, and backtests the resulting strategy.
-- `checkpoints/*.json`: cached model snapshots for each ticker.
+1. Fetches recent Yahoo Finance history and the latest quote using `yfinance-rs`.
+2. Keeps completed candles, sorts and deduplicates them, and rejects invalid OHLCV data.
+3. Builds 11 features and pairs each feature row with the following candle's return, scaled by recent volatility.
+4. Reuses a matching model checkpoint or sends the dataset to Julia for symbolic regression.
+5. Scales the latest features using the model's training bounds, evaluates the discovered equation, and prints a prediction and position signal.
 
-```text
-.
-├── Cargo.toml
-├── README.md
-├── src/
-│   ├── main.rs
-│   └── model.jl
-└── target/
+Julia communicates with Rust over JSON on standard input/output. Its entry point is `src/engine.jl`; supporting code is in `src/mathtools.jl` and `src/chaintools.jl`.
+
+## Requirements
+
+- Rust and Cargo (the project uses the Rust 2024 edition).
+- Julia available as `julia` on `PATH`, or the executable path set in `JULIA_PATH`.
+- Julia packages `JSON3`, `SymbolicRegression`, and `LoopVectorization`.
+- Internet access to retrieve Yahoo Finance data.
+
+Install the Julia dependencies in the active Julia environment:
+
+```julia
+using Pkg
+Pkg.add(["JSON3", "SymbolicRegression", "LoopVectorization"])
+```
+
+If Julia is not on `PATH`, set `JULIA_PATH` to its executable. For example, in PowerShell:
+
+```powershell
+$env:JULIA_PATH = "C:\path\to\julia.exe"
+```
+
+On macOS or Linux:
+
+```bash
+export JULIA_PATH=/path/to/julia
 ```
 
 ## Run
 
-From the repository root:
+Run one or more Yahoo Finance ticker symbols from the repository root:
 
 ```bash
-cargo run SMCI
-cargo run ETH-USD
-cargo run NQ=F
+cargo run -- AAPL
+cargo run -- BTC-USD ETH-USD
+cargo run -- ES=F EURUSD=X ^GSPC
 ```
 
-If Julia is not on `PATH`, set it explicitly:
+Pass `--debug` to enable debug-level application logs:
 
 ```bash
-JULIA_PATH=/path/to/julia
+cargo run -- --debug AAPL
 ```
 
-> [!NOTE]
-> This is NOT production software. Any data retrieved from this program is NOT the objective truth, let alone a financial recommendation. Manage your money mindfully.
+Use `RUST_LOG` to set the Rust logger filter directly, for example `RUST_LOG=debug`.
 
-## Data contract
+The program processes the supplied tickers in order. It skips a ticker if there are fewer than 50 valid training samples or if it cannot build features for the latest completed candle.
 
-Different parts of market require different approaches. Data window is defined by the asset type:
+## Data and features
 
-| Asset type | Symbol marker | Candle interval |
-|---|---|---:|
-| Futures | `=F` | 10 minutes |
-| Currency | `=X` | 30 minutes |
-| Crypto | `-` | 1 hour |
-| Index | `^` | 4 hours |
-| Stock | default | 1 hour |
+The asset class is inferred from the symbol and determines the requested Yahoo Finance history range and candle interval:
 
-Target is calculated as:
-```text
-X(T) = features(previous valid candle)
-target_return(T) = (Close(T) - Close(previous valid candle)) / Close(previous valid candle)
-target_scaled_return(T) = target_return(T) / sigma(previous valid candle)
-```
+| Asset class | Symbol pattern | History range | Candle interval |
+|---|---|---:|---:|
+| Futures | contains `=F` | 5 days | 15 minutes |
+| Currency | contains `=X` | 1 month | 30 minutes |
+| Crypto | ends in `-USD` or `-USDT` | 3 months | 1 hour |
+| Index | contains `^` | 1 year | 4 hours |
+| Stock | any other symbol | 6 months | 1 hour |
 
-Julia model is not fitting raw OHLCV rows. Features are combining raw values and computed properties of the market state. Pipeline builds 11 engineered features from the completed candle:
+For every completed candle with sufficient prior history, Rust calculates these 11 features:
 
-1. close/open return
-2. gap from preceding close to open
-3. high-low range relative to close
-4. upper wick relative to close
-5. lower wick relative to close
-6. volume relative to the prior 20-candle mean volume
-7. five-candle rolling mean of feature 1
-8. five-candle rolling standard deviation of feature 1 (`sigma`)
-9. close relative to its 50-candle moving average
-10. close relative to its 200-candle moving average
-11. UTC hour-of-day phase encoded as `sin(2π * hour / 24)`
+1. Close-to-open return.
+2. Open-to-previous-close gap.
+3. High-low range relative to close.
+4. Upper wick relative to close.
+5. Lower wick relative to close.
+6. Volume relative to the mean volume of up to the preceding 20 candles.
+7. Mean close-to-close return over the preceding five candles.
+8. Standard deviation of those five returns (`sigma`).
+9. Close relative to the 50-candle moving average.
+10. Close relative to the 200-candle moving average.
+11. UTC time-of-day encoded as `sin(2π × hour / 24)`.
 
-Rows with insufficient history, invalid values, non-positive prices, non-finite values, or bad volume are discarded. The code keeps only the most recent valid completed candle as the live feature vector (`last_features` / `last_features_ts`).
+Rows are discarded when prices, volume, or derived values are invalid. Invalid candles break the feature/target sequence rather than being silently bridged.
 
-## Pipeline
-
-### Rust
-The current Rust executes the following:
-
-1. Fetches recent history via `yfinance-rs` at the asset-specific interval.
-2. Validates each bar (`open/high/low/close/volume`, monotonicity, positive values, etc.).
-3. Builds a dataset of delayed features and sigma-scaled targets.
-4. Passes the dataset into Julia for symbolic regression.
-5. Loads or reuses a valid checkpoint when the model version, time window, target history, feature bounds, and calibration values all match.
-6. Saves a checkpoint containing the final accepted model state.
-7. Applies the stored feature minima/maxima and calibration values to the current live feature vector before evaluating the expression.
-
-The live position transform computed via:
+The target for a feature row at candle *t* is the next candle's close-to-close return divided by the five-candle volatility (`sigma`) calculated at *t*:
 
 ```text
-position = tanh((prediction - calibration_mean) / calibration_std)
+target_return(t+1) = (close(t+1) - close(t)) / close(t)
+target_scaled_return(t+1) = target_return(t+1) / sigma(t)
 ```
 
-Checkpoint caching and validation are conditioned by:
-- same `model_version` (Rust validator)
-- accepted status
-- finite `prediction_mean` and `prediction_std`
-- 11-value `feature_min` and `feature_max`
-- same `first_ts` and `last_ts`
-- same target `history` as the current dataset
+## Model and inference
 
-### Julia
+Julia scales each feature to the range `[-1, 1]` using its 1st and 99th percentile training bounds, then runs `SymbolicRegression.jl`. Current search settings are defined in `src/mathtools.jl`: a budget of 1,000 iterations, multithreading, a maximum expression size of 20, and binary `+`, `-`, and `*` operators. The unary operator set is `sqrt`, `cbrt`, `tanh`, `abs`, and `softplus`.
 
-The Julia model uses **SymbolicRegression.jl** with a restricted operator set and a walk-forward evaluation scheme. Relevant current settings in `src/model.jl` include:
+The model's prediction center and scale are estimated from its in-sample predictions using the median and scaled median absolute deviation. The latest scaled prediction is transformed into a bounded position signal:
 
-- `BUDGET = 600`
-- `POPULATIONS = max(1, Threads.nthreads())`
-- `POPULATION_SIZE = 30`
-- `FOLDS = 3`
-- `N_FEATURES = 11`
-- transaction cost rate `COST_RATE = 0.0005`
-- minimum calibration scale floor and signed return handling
-- training and validation metrics based on: compounded net returns, Sharpe, Sortino, max drawdown, and turnover
-- annualization matched to the Rust asset class: futures use 10-minute bars across a 23-hour weekday session, currencies use 30-minute bars across 24-hour weekdays, crypto uses 24/7 hourly bars, indices use 4-hour bars during 6.5-hour sessions, and stocks use hourly bars during 6.5-hour sessions
+```text
+position = tanh((prediction - prediction_median) / prediction_scale)
+```
 
-The optimization uses a cost-sensitive objective, complexity penalties, and chronological validation folds before accepting a final equation.
+Rust also reports the equation, the scaled prediction, an estimated raw return (prediction multiplied by the latest `sigma`), the model's in-sample Sharpe metric, and a finite-difference feature gradient. These are research diagnostics, not independently validated forecasts or recommendations.
+
+## Checkpoints
+
+Model checkpoints are stored as `checkpoints/<ticker>.json`. A cached model is reused only when its version, accepted status, feature bounds, prediction calibration, history timestamps, and target history match the current dataset. Otherwise, Julia runs again and Rust writes a replacement checkpoint.
+
+Generated `checkpoints/`, `outputs/`, and Rust `target/` directories are ignored by Git.
+
+## Tests
+
+Run the Rust unit tests with:
+
+```bash
+cargo test
+```
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

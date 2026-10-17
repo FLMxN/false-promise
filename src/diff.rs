@@ -54,10 +54,10 @@ pub fn grad(
 
 pub fn lead(grad: Vec<f64>) -> (i32, f64) {
     let mx = grad.clone().into_iter()
-        .reduce(f64::max)
+        .reduce(f64::max).map(|x| x.abs())
         .unwrap_or(0.);
     let sum: f64 = grad.iter().map(|x| x.abs()).sum();
-    let mut k = 0;
+    let mut k = 1;
     for i in grad {
         if i == mx {
             return (k, mx/sum)

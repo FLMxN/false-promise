@@ -290,10 +290,7 @@ async fn fetch(token: &str) -> Result<Dataset, Box<dyn std::error::Error>> {
     let ticker = Ticker::new(&client, token);
     let quote = ticker.quote().await?;
     info!(
-        "Range: {}", asset_range(token)
-    );
-    info!(
-        "Interval: {}", asset_interval(token)
+        "Range: {}; Interval: {}", asset_range(token), asset_interval(token)
     );
     if let Some(price) = quote.price.as_ref() {
         info!("Latest price for {}: {}", token, price);
