@@ -97,8 +97,6 @@ fn draw_candles(
         .map(|bar| bar.high)
         .fold(f64::NEG_INFINITY, f64::max);
     let padding = ((max_price - min_price) * 0.08).max(max_price.abs() * 0.001);
-    let x_start = candles.first().expect("at least two candles").ts;
-    let x_end = candles.last().expect("at least two candles").ts;
     let mut chart = ChartBuilder::on(area)
         .margin(24)
         .caption(
@@ -107,14 +105,23 @@ fn draw_candles(
         )
         .x_label_area_size(52)
         .y_label_area_size(150)
-        .build_cartesian_2d(x_start..x_end, (min_price - padding)..(max_price + padding))?;
+        .build_cartesian_2d(
+            0..candles.len() as i32 + 1,
+            (min_price - padding)..(max_price + padding),
+        )?;
 
     chart
         .configure_mesh()
         .x_labels(8)
         .y_labels(7)
-        .x_label_formatter(&|timestamp| {
-            chrono::DateTime::<chrono::Utc>::from_timestamp(*timestamp, 0)
+        .x_label_formatter(&|bar_index| {
+            let Some(bar) = bar_index
+                .checked_sub(1)
+                .and_then(|index| candles.get(index as usize))
+            else {
+                return String::new();
+            };
+            chrono::DateTime::<chrono::Utc>::from_timestamp(bar.ts, 0)
                 .map(|date| date.format("%m-%d %H:%M").to_string())
                 .unwrap_or_default()
         })
@@ -126,9 +133,9 @@ fn draw_candles(
     let candle_width = (area.dim_in_pixel().0 as f64 / candles.len() as f64 * 0.55)
         .round()
         .clamp(5.0, 16.0) as u32;
-    chart.draw_series(candles.iter().map(|bar| {
+    chart.draw_series(candles.iter().enumerate().map(|(index, bar)| {
         CandleStick::new(
-            bar.ts,
+            index as i32 + 1,
             bar.open,
             bar.high,
             bar.low,
