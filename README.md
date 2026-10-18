@@ -1,4 +1,4 @@
-# False Promise
+# False Promise § <br />Quant finance research pipeline, powered by Rust and Julia
 
 An experimental market-research pipeline built with Rust and Julia. It downloads market candles from Yahoo Finance, trains a symbolic-regression model, and evaluates that model on the latest completed candle.
 
@@ -62,6 +62,8 @@ cargo run -- --debug AAPL
 Use `RUST_LOG` to set the Rust logger filter directly, for example `RUST_LOG=debug`.
 
 The program processes the supplied tickers in order. It skips a ticker if there are fewer than 50 valid training samples or if it cannot build features for the latest completed candle.
+
+For each successful prediction, the program also writes a 1920×1080 PNG market passport to `graphs/<ticker>_passport.png`. It includes recent completed candles, the model's position and return estimates, its in-sample Sharpe metric, the equation, and the local prediction gradient with respect to each scaled feature.
 
 ## Data and features
 

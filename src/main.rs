@@ -11,6 +11,7 @@ use std::{
 use yfinance_rs::{Interval, Range, Ticker, YfClient};
 
 mod diff;
+mod graph;
 use crate::diff::{grad, lead};
 
 const VOL_WINDOW: usize = 20;
@@ -21,7 +22,7 @@ const K_BARS: usize = 1;
 const MIN_SIGMA: f64 = 1e-8;
 const MIN_PREDICTION_STD: f64 = 1e-12;
 
-const MODEL_VERSION: &str = "2026-10-08/features-v6-winsorized-context-features-hourly-y1-folds5-v10-hac-sample-gate-asset-annualization-v1";
+const MODEL_VERSION: &str = "2026-10-17/new";
 
 #[derive(Deserialize, Debug)]
 struct Payload {
@@ -89,6 +90,7 @@ struct Bar {
 }
 #[derive(Debug)]
 struct Dataset {
+    bars: Vec<Bar>,
     x: Vec<Vec<f64>>,
     target_scaled_return: Vec<f64>,
     target_scales: Vec<f64>,
@@ -157,6 +159,7 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
     let mut target_scaled_return = vec![];
     let mut target_scales = vec![];
     let mut target_timestamps = vec![];
+    let mut valid_bars = Vec::with_capacity(ordered_bars.len());
     let mut prev_close = None;
     let mut volume_history = VecDeque::with_capacity(VOL_WINDOW);
     let mut feature_history = VecDeque::with_capacity(FEATURE_WINDOW);
@@ -185,6 +188,7 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
             close_history.clear();
             continue;
         }
+        valid_bars.push(bar.clone());
         if first_ts == 0 {
             first_ts = bar.ts
         };
@@ -272,6 +276,7 @@ fn build_dataset(bars: &[Bar]) -> Dataset {
     debug_assert!(x.iter().all(|row| row.len() == N_FEATS && all_finite(row)));
     debug_assert!(target_scaled_return.iter().all(|v| v.is_finite()));
     Dataset {
+        bars: valid_bars,
         x,
         target_scaled_return,
         target_scales,
@@ -590,20 +595,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     token, (position*10000.0).round()/10000.0, (prediction*10000.0).round()/10000.0, (raw_return*10000.0).round()/10000.0
                 );
                 info!("Sharpe: {:#?}", metrics.sharpe.unwrap_or_else(|| 0.0));
-                match grad(equation, &data.last_features, minima, maxima) {
-                    Ok(g) => {
-                        let loco = lead(g.clone());
+                let gradient = match grad(equation, &data.last_features, minima, maxima) {
+                    Ok(values) => {
+                        let loco = lead(values.clone());
                         let det = match loco.1 {
                             _ if loco.1 < 0.5 => "low",
                             _ if loco.1 > 0.9 => "high",
                             _ => "mid"
                         };
-                        info!("Gradient (∂f/∂x_scaled): {:?}", g);
-                        info!("Leading variable: x{} ({}%); determination: {}", loco.0, ((loco.1)*100.0).round(), det)
+                        info!("Gradient (∂f/∂x_scaled): {:?}", values);
+                        info!("Leading variable: x{} ({}%); determination: {}", loco.0, ((loco.1)*100.0).round(), det);
+                        Some(values)
                     },
-                    Err(e) => warn!("Gradient computation failed: {e}"),
-                }
-
+                    Err(e) => {
+                        warn!("Gradient computation failed: {e}");
+                        None
+                    }
+                };
+                let graph_path = graph::render_passport(
+                    &token,
+                    &data.bars,
+                    &data.last_features,
+                    minima,
+                    maxima,
+                    prediction,
+                    raw_return,
+                    position,
+                    metrics.sharpe.unwrap_or(0.0),
+                    equation,
+                    gradient.as_deref(),
+                )?;
+                info!("Passport saved to {}", graph_path.display());
             }
             Ok(_) => warn!("Non-finite equation result for {}", token),
             Err(e) => error!("Evaluation error for {}: {}", token, e),

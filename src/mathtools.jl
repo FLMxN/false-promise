@@ -2,11 +2,12 @@ module MathTools
 
 using Statistics
 using SymbolicRegression: eval_tree_array, Options
+using LossFunctions: HuberLoss
 export fbounds, fscale, matrix, aperiods, sqr, relu, cube, softplus, sharpe, SR_OPTIONS, MIN_PREDICTION_STD, N_FEATURES, BUDGET
 
 const MIN_PREDICTION_STD = 1e-12
 const N_FEATURES = 11
-const BUDGET = 1000
+const BUDGET = 1600
 
 sqr(x) = x * x
 relu(x) = x > 0.0 ? x : 0.0
@@ -28,7 +29,8 @@ const SR_OPTIONS = Options(
         cbrt => 1, cube => 3, softplus => 1
     ),
     parsimony = 1e-2,
-    should_optimize_constants = false,
+    elementwise_loss=HuberLoss(1.0),
+    should_optimize_constants = true,
     batching = true,
     batch_size = 256,
     turbo = true,

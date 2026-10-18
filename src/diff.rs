@@ -53,16 +53,11 @@ pub fn grad(
 }
 
 pub fn lead(grad: Vec<f64>) -> (i32, f64) {
-    let mx = grad.clone().into_iter()
-        .reduce(f64::max).map(|x| x.abs())
-        .unwrap_or(0.);
+    let mx = grad.iter().map(|x| x.abs()).fold(0.0, f64::max);
     let sum: f64 = grad.iter().map(|x| x.abs()).sum();
-    let mut k = 1;
-    for i in grad {
-        if i == mx {
-            return (k, mx/sum)
-        }
-    k += 1;
+    if sum == 0.0 { return (0, 0.0); }
+    for (k, v) in grad.iter().enumerate() {
+        if v.abs() == mx { return ((k + 1) as i32, mx / sum); }
     }
-    (0, mx/sum)
+    (0, mx / sum)
 }
