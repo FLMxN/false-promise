@@ -1,5 +1,4 @@
 use std::{error::Error, fs, path::PathBuf};
-// use show_image::{create_window, ImageView, ImageInfo};
 use plotters::{prelude::*, style::FontStyle};
 
 use crate::Bar;
@@ -271,10 +270,10 @@ fn draw_gradient(
             (value_x, y + 4),
             ("sans-serif", 32).into_font().color(&MUTED),
         ))?;
-        area.draw(&PathElement::new(
-            vec![(center_x, y - 5), (center_x, y + 17)],
-            MUTED.mix(0.55),
-        ))?;
+        // area.draw(&PathElement::new(
+        //     vec![(center_x, y + 6), (center_x, y + 22)],
+        //     MUTED.mix(0.55),
+        // ))?;
 
         let length = (magnitude * half_width as f64).round() as i32;
         if length > 0 {
@@ -285,7 +284,7 @@ fn draw_gradient(
             };
             let color = if *value >= 0.0 { UP } else { DOWN };
             area.draw(&Rectangle::new(
-                [(left, y), (right, y + 12)],
+                [(left, y+6), (right, y + 22)],
                 color.mix(0.88).filled(),
             ))?;
         }
@@ -326,15 +325,6 @@ fn wrap_text(text: &str, max_chars: usize, max_lines: usize) -> Vec<String> {
     }
     lines
 }
-
-// #[show_image::main]
-// fn show(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-//     let img = image::open(path)?;
-//     let window = create_window(path, Default::default())?;
-//     window.set_image("my-image", img)?;
-//     window.run()?;
-//     Ok(())
-// }
 
 #[cfg(test)]
 mod tests {

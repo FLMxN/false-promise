@@ -13,8 +13,4 @@ tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
 log = "0.4"
 env_logger = "0.10"
-evalexpr-jit = "0.2.3"
-symb_anafis = "0.8.1"
-exmex = { version = "0.21.0", features = ["partial"] }
 plotters = "0.3"
-show-image = "0.14.1"
