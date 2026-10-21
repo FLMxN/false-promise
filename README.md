@@ -65,7 +65,7 @@ The program processes the supplied tickers in order. It skips a ticker if there 
 
 For each successful prediction, the program also writes a 1920×1080 PNG market passport to `graphs/<ticker>_passport.png`. It includes recent completed candles, the model's position and return estimates, its in-sample Sharpe metric, the equation, and the local prediction gradient with respect to each scaled feature.
 
-## Data and features
+## Data
 
 The asset class is inferred from the symbol and determines the requested Yahoo Finance history range and candle interval:
 
@@ -77,6 +77,7 @@ The asset class is inferred from the symbol and determines the requested Yahoo F
 | Index | contains `^` | 1 year | 4 hours |
 | Stock | any other symbol | 6 months | 1 hour |
 
+### Features
 For every completed candle with sufficient prior history, Rust calculates these 11 features:
 
 1. Close-to-open return.
@@ -93,6 +94,7 @@ For every completed candle with sufficient prior history, Rust calculates these 
 
 Rows are discarded when prices, volume, or derived values are invalid. Invalid candles break the feature/target sequence rather than being silently bridged.
 
+### Target
 The target for a feature row at candle *t* is the next candle's close-to-close return divided by the five-candle volatility (`sigma`) calculated at *t*:
 
 ```text
@@ -102,7 +104,7 @@ target_scaled_return(t+1) = target_return(t+1) / sigma(t)
 
 ## Model and inference
 
-Julia scales each feature to the range `[-1, 1]` using its 1st and 99th percentile training bounds, then runs `SymbolicRegression.jl`. Current search settings are defined in `src/mathtools.jl`: a budget of 1,000 iterations, multithreading, a maximum expression size of 20, and binary `+`, `-`, and `*` operators. The unary operator set is `sqrt`, `cbrt`, `tanh`, `abs`, and `softplus`.
+Julia scales each feature to the range `[-1, 1]` using its 1st and 99th percentile training bounds, then runs `SymbolicRegression.jl`. Current search settings are defined in `src/mathtools.jl`: a budget of 1,000 iterations, multithreading, a maximum expression size of 20, and binary `+`, `-`, and `*` operators. The unary operator set is `sqrt`, `cbrt` and `tanh`.
 
 The model's prediction center and scale are estimated from its in-sample predictions using the median and scaled median absolute deviation. The latest scaled prediction is transformed into a bounded position signal:
 
@@ -110,7 +112,9 @@ The model's prediction center and scale are estimated from its in-sample predict
 position = tanh((prediction - prediction_median) / prediction_scale)
 ```
 
-Rust also reports the equation, the scaled prediction, an estimated raw return (prediction multiplied by the latest `sigma`), the model's in-sample Sharpe metric, and a finite-difference feature gradient. These are research diagnostics, not independently validated forecasts or recommendations.
+### Report
+
+Rust reports the equation, the scaled prediction, an estimated raw return (prediction multiplied by the latest `sigma`), the model's in-sample Sharpe, out-of-sample Sharpe, and a finite-difference feature gradient. These are research diagnostics, not independently validated forecasts or recommendations.
 
 ## Checkpoints
 
