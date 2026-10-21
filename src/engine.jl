@@ -29,12 +29,14 @@ global_logger(logger)
 #####################################################################################################
 
 function discover(X, y, asset_type)
-    feature_min, feature_max = fbounds(X)
-    Xp = permutedims(fscale(X, feature_min, feature_max))
+    train_X = matrix(X[begin:Int(round(length(X)*0.8))-1])
+    train_Y = y[begin:Int(round(length(y)*0.8))-1]
+    feature_min, feature_max = fbounds(train_X)
+    Xp = permutedims(fscale(train_X, feature_min, feature_max))
     hof = nothing
     redirect_stdout(devnull) do
         hof = equation_search(
-            Xp, y;
+            Xp, train_Y;
             niterations = BUDGET,
             options = SR_OPTIONS,
             parallelism = :multithreading,
@@ -74,14 +76,31 @@ function main(io = stdin)
         JSON3.write(stdout, rejected("invalid or insufficient feature/target data"))
     else
         @info "Input validated, starting discovery"
-        hof, X, fmin, fmax = discover(matrix(rows), y_scaled, asset_type)
+        hof, X, fmin, fmax = discover(rows, y_scaled, asset_type)
 
         best = argmin(m -> m.loss, hof.members)
         result = out_payload(hof, X, fmin, fmax)
 
         if get(result, "status", "") == "ok"
+            n_ins = size(X, 2)                                  
+
+            y_ins = y_scaled[1:n_ins]
+            s_ins = scales[1:n_ins]
+            ins_sharpe = sharpe(best.tree, X, y_ins, s_ins, asset_type)
+
+            if n_ins < length(y_scaled)
+                oos_rows = rows[(n_ins + 1):end]
+                X_oos    = permutedims(fscale(matrix(oos_rows), fmin, fmax))
+                y_oos    = y_scaled[(n_ins + 1):end]
+                s_oos    = scales[(n_ins + 1):end]
+                oos_sharpe = sharpe(best.tree, X_oos, y_oos, s_oos, asset_type)
+            else
+                oos_sharpe = NaN
+            end
+
             result["metrics"] = Dict(
-                "sharpe" => sharpe(best.tree, X, y_scaled, scales, asset_type),
+                "ins_sharpe" => ins_sharpe,
+                "oos_sharpe" => oos_sharpe,
             )
         end
 

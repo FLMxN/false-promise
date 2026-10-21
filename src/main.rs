@@ -49,7 +49,8 @@ struct Payload {
 
 #[derive(Deserialize, Debug, Serialize, Clone)]
 struct Metrics {
-    sharpe: Option<f64>,
+    ins_sharpe: Option<f64>,
+    oos_sharpe: Option<f64>,
     sortino: Option<f64>,
     max_drawdown: Option<f64>,
     turnover: Option<f64>,
@@ -558,7 +559,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let metrics = payload
             .metrics.unwrap_or_else( || {
                 Metrics {
-                    sharpe: Some(0.0),
+                    ins_sharpe: Some(0.0),
+                    oos_sharpe: Some(0.0),
                     sortino: Some(0.0),
                     max_drawdown: Some(0.0),
                     turnover: Some(0.0),
@@ -589,12 +591,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let scale = data.last_features[SCALE_FEATURE_INDEX];
                 let raw_return = prediction * scale;
                 let position = position_for(prediction, prediction_mean, prediction_std);
+                let ins_sharpe = metrics.ins_sharpe.unwrap_or_else(|| 0.0);
+                let oos_sharpe = metrics.oos_sharpe.unwrap_or_else(|| 0.0);
+                let overfitted = if ins_sharpe/oos_sharpe > 1.44 { "YES" } else { "NO" };
+
                 info!("Equation: {equation}");
                 info!(
                     "Prediction for {}: position={}, scaled_return={}, raw_return={}",
                     token, (position*10000.0).round()/10000.0, (prediction*10000.0).round()/10000.0, (raw_return*10000.0).round()/10000.0
                 );
-                info!("Sharpe: {:#?}", metrics.sharpe.unwrap_or_else(|| 0.0));
+
+                info!("###########################################################################################");
+                info!("Overfitted: {}", overfitted);
+                info!("Sharpe (INS): {:#?}", ins_sharpe);
+                info!("Sharpe (OOS): {:#?}", oos_sharpe);
+                info!("###########################################################################################");
+
                 let gradient = match grad(equation, &data.last_features, minima, maxima) {
                     Ok(values) => {
                         let loco = lead(values.clone());
@@ -612,6 +624,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None
                     }
                 };
+
+                info!("###########################################################################################");
                 let graph_path = graph::render_passport(
                     &token,
                     &data.bars,
@@ -621,7 +635,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     prediction,
                     raw_return,
                     position,
-                    metrics.sharpe.unwrap_or(0.0),
+                    metrics.ins_sharpe.unwrap_or(0.0),
+                    metrics.oos_sharpe.unwrap_or(0.0),
                     equation,
                     gradient.as_deref(),
                 )?;

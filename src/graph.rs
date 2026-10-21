@@ -21,7 +21,8 @@ pub(super) fn render_passport(
     prediction: f64,
     raw_return: f64,
     position: f64,
-    sharpe: f64,
+    ins_sharpe: f64,
+    oos_sharpe: f64,
     equation: &str,
     gradient: Option<&[f64]>,
 ) -> Result<PathBuf, Box<dyn Error>> {
@@ -71,7 +72,8 @@ pub(super) fn render_passport(
             prediction,
             raw_return,
             position,
-            sharpe,
+            ins_sharpe,
+            oos_sharpe,
             equation,
         )?;
         draw_gradient(&features_area, gradient)?;
@@ -152,7 +154,8 @@ fn draw_summary(
     prediction: f64,
     raw_return: f64,
     position: f64,
-    sharpe: f64,
+    ins_sharpe: f64,
+    oos_sharpe: f64,
     equation: &str,
 ) -> Result<(), Box<dyn Error>> {
     area.fill(&PANEL)?;
@@ -189,13 +192,18 @@ fn draw_summary(
         ("sans-serif", 28).into_font().color(&MUTED),
     ))?;
     area.draw(&Text::new(
-        format!("In-sample Sharpe  {:+.3}", sharpe),
+        format!("In-Sample Sharpe  {:+.3}", ins_sharpe),
         (22, 225),
         ("sans-serif", 28).into_font().color(&MUTED),
     ))?;
     area.draw(&Text::new(
+        format!("Out-Of-Sample Sharpe  {:+.3}", oos_sharpe),
+        (22, 250),
+        ("sans-serif", 28).into_font().color(&MUTED),
+    ))?;
+    area.draw(&Text::new(
         "DISCOVERED EQUATION",
-        (22, 265),
+        (22, 300),
         ("sans-serif", 28)
             .into_font()
             .style(FontStyle::Bold)
@@ -205,7 +213,7 @@ fn draw_summary(
     for (index, line) in wrap_text(equation, 42, 4).iter().enumerate() {
         area.draw(&Text::new(
             line.clone(),
-            (22, 300 + index as i32 * 30),
+            (22, 325 + index as i32 * 30),
             ("sans-serif", 32).into_font().color(&MUTED),
         ))?;
     }
