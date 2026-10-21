@@ -8,7 +8,7 @@ export fbounds, fscale, matrix, aperiods, sqr, relu, cube, softplus, sharpe, SR_
 const MIN_PREDICTION_STD = 1e-12
 const N_FEATURES = 11
 const BUDGET = 1200
-const COST_RATE = 0.05
+const COST_RATE = 0.0005
 
 sqr(x) = x * x
 relu(x) = x > 0.0 ? x : 0.0
@@ -23,8 +23,8 @@ const SR_OPTIONS = Options(
 
     binary_operators = [+, -, *],
     unary_operators = [sqrt, cbrt, tanh],
-    maxsize = 20,
-    maxdepth = 10,
+    maxsize = 12,
+    maxdepth = 5,
     complexity_of_operators = Dict(
         (+) => 1, (-) => 1, (*) => 1, (/) => 1,
         sqrt => 1, sqr => 3, tanh => 1, abs => 1,
@@ -78,10 +78,13 @@ function sharpe(tree, X, y_scaled, scales, asset_type)
     σ = 1.4826 * median(abs.(pred_scaled .- μ))
     σ > MIN_PREDICTION_STD || return NaN
 
-    position = tanh.((pred_scaled .- μ) ./ σ)
-
+    position = tanh.((pred_scaled .- μ) ./ σ)    
+    prev_position = vcat(0.0, position[1:end-1])
+    turnover = abs.(position .- prev_position)
+    
     raw_returns = Float64.(y_scaled) .* Float64.(scales)
-    strategy_returns = position .* raw_returns
+    gross_returns = position .* raw_returns
+    strategy_returns = gross_returns .- (turnover .* COST_RATE)
 
     μr = mean(strategy_returns)
     σr = std(strategy_returns)

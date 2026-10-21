@@ -593,8 +593,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let position = position_for(prediction, prediction_mean, prediction_std);
                 let ins_sharpe = metrics.ins_sharpe.unwrap_or_else(|| 0.0);
                 let oos_sharpe = metrics.oos_sharpe.unwrap_or_else(|| 0.0);
-                let overfitted = if ins_sharpe/oos_sharpe > 1.44 { "YES" } else { "NO" };
+                let overfitted = if (ins_sharpe/oos_sharpe).abs() > 1.44 || ins_sharpe-oos_sharpe > 1.44 { "YES" } else { "NO" };
 
+                info!("###########################################################################################");
                 info!("Equation: {equation}");
                 info!(
                     "Prediction for {}: position={}, scaled_return={}, raw_return={}",
