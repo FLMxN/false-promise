@@ -28,7 +28,7 @@ global_logger(logger)
 
 #####################################################################################################
 
-function discover(X, y, asset_type)
+function discover(X, y)
     train_X = matrix(X[begin:Int(round(length(X)*0.8))-1])
     train_Y = y[begin:Int(round(length(y)*0.8))-1]
     feature_min, feature_max = fbounds(train_X)
@@ -101,6 +101,7 @@ function main(io = stdin)
             result["metrics"] = Dict(
                 "ins_sharpe" => ins_sharpe,
                 "oos_sharpe" => oos_sharpe,
+                "annualization" => aperiods(asset_type)
             )
         end
 

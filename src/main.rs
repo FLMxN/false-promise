@@ -55,6 +55,7 @@ struct Metrics {
     max_drawdown: Option<f64>,
     turnover: Option<f64>,
     total_return: Option<f64>,
+    annualization: Option<f64>
 }
 #[derive(Debug, Deserialize, Serialize)]
 struct Checkpoint {
@@ -124,11 +125,11 @@ fn asset_type(token: &str) -> &'static str {
 
 fn asset_range(token: &str) -> Range {
     match asset_type(token) {
-        "futures" => Range::D5,
-        "currency" => Range::M1,
-        "crypto" => Range::M3,
-        "index" => Range::Y1,
-        _ => Range::M6,
+        "futures" => Range::M1,
+        "currency" => Range::M3,
+        "crypto" => Range::M6,
+        "index" => Range::Y2,
+        _ => Range::Y1,
     }
 }
 
@@ -564,7 +565,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     sortino: Some(0.0),
                     max_drawdown: Some(0.0),
                     turnover: Some(0.0),
-                    total_return: Some(0.0)
+                    total_return: Some(0.0),
+                    annualization: Some(0.0)
                 }
             }
             );
@@ -591,6 +593,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let scale = data.last_features[SCALE_FEATURE_INDEX];
                 let raw_return = prediction * scale;
                 let position = position_for(prediction, prediction_mean, prediction_std);
+                let annualization = metrics.annualization.unwrap_or_else(|| 0.0);
                 let ins_sharpe = metrics.ins_sharpe.unwrap_or_else(|| 0.0);
                 let oos_sharpe = metrics.oos_sharpe.unwrap_or_else(|| 0.0);
                 let overfitted = if (ins_sharpe/oos_sharpe).abs() > 1.44 || ins_sharpe-oos_sharpe > 1.44 { "YES" } else { "NO" };
@@ -604,8 +607,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 info!("###########################################################################################");
                 info!("Overfitted: {}", overfitted);
-                info!("Sharpe (INS): {:#?}", ins_sharpe);
-                info!("Sharpe (OOS): {:#?}", oos_sharpe);
+                info!("[INS] Sharpe: {:#?}; T-Stat: {:#?}", (ins_sharpe*10000.0).round()/10000.0, (ins_sharpe*10000.0/annualization.sqrt()).round()/10000.0);
+                info!("[OOS] Sharpe: {:#?}; T-Stat: {:#?}", (oos_sharpe*10000.0).round()/10000.0, (oos_sharpe*10000.0/annualization.sqrt()).round()/10000.0);
                 info!("###########################################################################################");
 
                 let gradient = match grad(equation, &data.last_features, minima, maxima) {
