@@ -8,6 +8,7 @@ using SymbolicRegression: equation_search
 using SymbolicRegression
 using LoopVectorization
 using Logging
+using ConstructionBase
 
 struct WarningFilterLogger{L <: AbstractLogger} <: AbstractLogger
     logger::L
@@ -28,9 +29,12 @@ global_logger(logger)
 
 #####################################################################################################
 
-function discover(X, y)
-    train_X = matrix(X[begin:Int(round(length(X)*0.8))-1])
-    train_Y = y[begin:Int(round(length(y)*0.8))-1]
+function discover(X, y, scales, asset_type)
+    n_train = Int(round(length(y) * 0.8)) - 1
+    train_X = matrix(X[begin:n_train])
+    train_Y = y[begin:n_train]
+    train_scales = scales[begin:n_train]
+    
     feature_min, feature_max = fbounds(train_X)
     Xp = permutedims(fscale(train_X, feature_min, feature_max))
     hof = nothing
@@ -38,8 +42,13 @@ function discover(X, y)
         hof = equation_search(
             Xp, train_Y;
             niterations = BUDGET,
-            options = SR_OPTIONS,
+            options = build_sr_options(
+                loss_function    = make_sharpe_loss(train_scales, asset_type),
+                elementwise_loss = nothing,
+            ),
             parallelism = :multithreading,
+            # elementwise_loss=nothing,
+            # loss_function=make_sharpe_loss(scales[begin:Int(round(length(scales)*0.8))-1], asset_type),
             verbosity = 1
         )
     end
@@ -76,7 +85,7 @@ function main(io = stdin)
         JSON3.write(stdout, rejected("invalid or insufficient feature/target data"))
     else
         @info "Input validated, starting discovery"
-        hof, X, fmin, fmax = discover(rows, y_scaled, asset_type)
+        hof, X, fmin, fmax = discover(rows, y_scaled, scales, asset_type)
 
         best = argmin(m -> m.loss, hof.members)
         result = out_payload(hof, X, fmin, fmax)

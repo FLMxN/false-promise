@@ -1,13 +1,13 @@
 module MathTools
 
 using Statistics
-using SymbolicRegression: eval_tree_array, Options
+using SymbolicRegression: eval_tree_array, Options, Dataset
 using LossFunctions: HuberLoss
-export fbounds, fscale, matrix, aperiods, sqr, relu, cube, softplus, sharpe, SR_OPTIONS, MIN_PREDICTION_STD, N_FEATURES, BUDGET
+export fbounds, fscale, matrix, aperiods, sqr, relu, cube, softplus, sharpe, sharpe_loss, make_sharpe_loss, build_sr_options, SR_OPTIONS, MIN_PREDICTION_STD, N_FEATURES, BUDGET
 
 const MIN_PREDICTION_STD = 1e-12
 const N_FEATURES = 11
-const BUDGET = 1200
+const BUDGET = 800
 const COST_RATE = 0.0005
 
 sqr(x) = x * x
@@ -15,32 +15,48 @@ relu(x) = x > 0.0 ? x : 0.0
 cube(x) = x * x * x
 softplus(x) = log1p(exp(x))
 
-const SR_OPTIONS = Options(
-    populations = Int(BUDGET / 20),
-    population_size = max(1, Threads.nthreads()),
-    ncycles_per_iteration = Int(BUDGET / 10),
-    tournament_selection_n = max(1, Threads.nthreads() - 1),
+function make_sharpe_loss(scales, asset_type)
+    function sharpe_loss(tree, dataset::Dataset{T,L}, options) where {T,L}
+        prediction, completed = eval_tree_array(tree, dataset.X, options)
+        !completed && return L(Inf)
+        sr = sharpe(tree, dataset.X, dataset.y, scales, asset_type)
+        (isnan(sr) || !isfinite(sr)) && return L(Inf)
+        return -L(sr)
+    end
+    return sharpe_loss
+end
 
-    binary_operators = [+, -, *],
-    unary_operators = [sqrt, cbrt, tanh],
-    maxsize = 12,
-    maxdepth = 5,
-    complexity_of_operators = Dict(
-        (+) => 1, (-) => 1, (*) => 1, (/) => 1,
-        sqrt => 1, sqr => 3, tanh => 1, abs => 1,
-        cbrt => 1, cube => 3, softplus => 1
-    ),
-    
-    complexity_of_constants=128,
-    should_optimize_constants = false,
+function build_sr_options(; loss_function=nothing, elementwise_loss=nothing)
+    return Options(
+        populations = Int(BUDGET / 20),
+        population_size = max(1, Threads.nthreads()),
+        ncycles_per_iteration = Int(BUDGET / 10),
+        tournament_selection_n = max(1, Threads.nthreads() - 1),
 
-    parsimony = 1e-2,
-    elementwise_loss=HuberLoss(1.0),
+        binary_operators = [+, -, *],
+        unary_operators = [sqrt, cbrt, tanh],
+        maxsize = 12,
+        maxdepth = 5,
+        complexity_of_operators = Dict(
+            (+) => 1, (-) => 1, (*) => 1, (/) => 1,
+            sqrt => 1, sqr => 3, tanh => 1, abs => 1,
+            cbrt => 1, cube => 3, softplus => 1,
+        ),
+        complexity_of_constants = 128,
+        should_optimize_constants = false,
+        parsimony = 1e-2,
 
-    batching = true,
-    batch_size = 256,
-    turbo = true,
-)
+        batching = false,
+        turbo = true,
+
+        loss_scale = :linear,
+
+        loss_function = loss_function,
+        elementwise_loss = elementwise_loss,
+    )
+end
+
+const SR_OPTIONS = build_sr_options(elementwise_loss = HuberLoss(1.0))
 
 function aperiods(asset_type::AbstractString)
     asset_type == "futures" && return 252 * 23 * 4
