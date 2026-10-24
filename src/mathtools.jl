@@ -9,6 +9,7 @@ const MIN_PREDICTION_STD = 1e-12
 const N_FEATURES = 11
 const BUDGET = 800
 const COST_RATE = 0.0005
+const LOSS_WEIGHT = 0.1
 
 sqr(x) = x * x
 relu(x) = x > 0.0 ? x : 0.0
@@ -21,7 +22,7 @@ function make_sharpe_loss(scales, asset_type)
         !completed && return L(Inf)
         sr = sharpe(tree, dataset.X, dataset.y, scales, asset_type)
         (isnan(sr) || !isfinite(sr)) && return L(Inf)
-        return -L(sr)
+        return exp(-L(sr-LOSS_WEIGHT))
     end
     return sharpe_loss
 end
@@ -49,7 +50,7 @@ function build_sr_options(; loss_function=nothing, elementwise_loss=nothing)
         batching = false,
         turbo = true,
 
-        loss_scale = :linear,
+        # loss_scale = :linear,
 
         loss_function = loss_function,
         elementwise_loss = elementwise_loss,
