@@ -596,7 +596,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let annualization = metrics.annualization.unwrap_or_else(|| 0.0);
                 let ins_sharpe = metrics.ins_sharpe.unwrap_or_else(|| 0.0);
                 let oos_sharpe = metrics.oos_sharpe.unwrap_or_else(|| 0.0);
-                let overfitted = if (ins_sharpe/oos_sharpe).abs() > 1.44 || ins_sharpe-oos_sharpe > 1.44 { "YES" } else { "NO" };
+                let overfitted = if (ins_sharpe/oos_sharpe).abs() > 1.44 { "YES" } else { "NO" };
 
                 info!("###########################################################################################");
                 info!("Equation: {equation}");

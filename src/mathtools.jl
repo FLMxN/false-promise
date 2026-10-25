@@ -7,9 +7,9 @@ export fbounds, fscale, matrix, aperiods, sqr, relu, cube, softplus, sharpe, sha
 
 const MIN_PREDICTION_STD = 1e-12
 const N_FEATURES = 11
-const BUDGET = 800
+const BUDGET = 1500
 const COST_RATE = 0.0005
-const LOSS_WEIGHT = 0.1
+const LOSS_WEIGHT = 0.0
 
 sqr(x) = x * x
 relu(x) = x > 0.0 ? x : 0.0
@@ -88,6 +88,31 @@ function fscale(X, mn, mx)
     return ifelse.(r .> 0, clamp.(s, -one(T), one(T)), zero(T))
 end
 
+function cost_weighted(pred_scaled, scales, μ, σ)
+    length(pred_scaled) == length(scales) ||
+        throw(DimensionMismatch("predictions and return scales must have equal lengths"))
+
+    predictions = Float64.(pred_scaled)
+    positions = tanh.((predictions .- Float64(μ)) ./ Float64(σ))
+    raw_forecasts = predictions .* Float64.(scales)
+    prev_position = 0.0
+
+    for i in eachindex(positions)
+        candidate = positions[i]
+        position_change = candidate - prev_position
+        expected_incremental_return = position_change * raw_forecasts[i]
+        transaction_cost = abs(position_change) * COST_RATE
+
+        if expected_incremental_return > transaction_cost
+            prev_position = candidate
+        else
+            positions[i] = prev_position
+        end
+    end
+
+    return positions
+end
+
 function sharpe(tree, X, y_scaled, scales, asset_type)
     pred_scaled, _ = eval_tree_array(tree, X, SR_OPTIONS)
 
@@ -95,7 +120,7 @@ function sharpe(tree, X, y_scaled, scales, asset_type)
     σ = 1.4826 * median(abs.(pred_scaled .- μ))
     σ > MIN_PREDICTION_STD || return NaN
 
-    position = tanh.((pred_scaled .- μ) ./ σ)    
+    position = cost_weighted(pred_scaled, scales, μ, σ)
     prev_position = vcat(0.0, position[1:end-1])
     turnover = abs.(position .- prev_position)
     
