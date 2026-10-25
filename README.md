@@ -7,7 +7,7 @@
 <p>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=for-the-badge&logo=opensourceinitiative&logoColor=cdd6f4" alt="Apache-2.0 License"></a>
   <img src="https://img.shields.io/badge/Rust-2024-orange?style=for-the-badge&logo=rust&logoColor=white" alt="Rust Version">
-  <img src="https://img.shields.io/badge/Julia-Symbolic Regression-9558B2?style=for-the-badge&logo=julia&logoColor=white" alt="Julia Method">
+  <img src="https://img.shields.io/badge/Julia-1.13-9558B2?style=for-the-badge&logo=julia&logoColor=white" alt="Julia Version">
   <img src="https://img.shields.io/badge/status-rolling-pink?style=for-the-badge" alt="Rolling">
   <a href="https://github.com/FLMxN/false-promise/stargazers"><img src="https://img.shields.io/github/stars/FLMxN/false-promise?style=for-the-badge&logo=github&logoColor=cdd6f4&label=stars&labelColor=181825&color=f9e2af" alt="GitHub Stars"></a>
 </p>
