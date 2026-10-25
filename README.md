@@ -1,21 +1,24 @@
 <div align="center">
 
-# False Promise
+<img src="assets/false-promise.svg" alt="False Promise logo" style="width:35%; height:auto;">
 
-### Quant finance research pipeline powered by Rust and Julia
+# False Promise
 
 <p>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=for-the-badge&logo=opensourceinitiative&logoColor=cdd6f4" alt="Apache-2.0 License"></a>
   <img src="https://img.shields.io/badge/Rust-2024-orange?style=for-the-badge&logo=rust&logoColor=white" alt="Rust Version">
   <img src="https://img.shields.io/badge/Julia-Symbolic Regression-9558B2?style=for-the-badge&logo=julia&logoColor=white" alt="Julia Method">
+  <a href="https://github.com/FLMxN/kopernik/stargazers"><img src="https://img.shields.io/github/stars/FLMxN/false-promise?style=for-the-badge&logo=github&logoColor=cdd6f4&label=stars&labelColor=181825&color=f9e2af" alt="GitHub Stars"></a>
 </p>
+
+Open-source quantitative finance research tool for NASDAQ via Yahoo Finance data, powered by Rust and Julia.
 
 > "The odds are with us. *Or are they*?" — ***Oracle, Dota 2***
 
 </div>
 
 > [!WARNING]
-> False Promise is experimental research software, not a trading system or financial advice. Market data may be incomplete, and model outputs are unvalidated estimates. Do not make financial decisions based on this program.
+> False Promise is experimental research software, not a trading system or financial advice. Market data may be incomplete, and model outputs are, in essence, unvalidated estimates. Manage your money mindfully.
 
 ## Table of contents
 
@@ -257,6 +260,13 @@ The model centers and scales predictions using their in-sample median and scaled
 position = tanh((prediction - prediction_median) / prediction_scale)
 ```
 
+During candidate scoring, Julia estimates each next-candle return as
+`prediction × current_volatility`. It applies a proposed position change only
+when its forecast incremental return exceeds the turnover cost (`0.05%` per
+unit); otherwise it retains the previous position. The accepted position path
+is scored against realized returns with turnover costs included, so decisions
+use the model forecast rather than future returns.
+
 ### Reported diagnostics
 
 The console report includes:
@@ -268,15 +278,13 @@ The console report includes:
 
 These are exploratory diagnostics, not validated forecasts or recommendations.
 
-## Checkpoints and output
-
-### Model cache
-
-Model checkpoints are stored in `checkpoints/<ticker>.json`. A cached result is reused only when its model version, accepted status, feature bounds, prediction calibration, history timestamps, and target history match the current dataset. If any of those checks fail, Julia runs again and Rust writes a replacement checkpoint.
+## Output and cache
 
 ### Market passport
 
 For each successful prediction, the app writes a **1920 × 1080 PNG** market passport to `graphs/<ticker>_passport.png`. It contains:
+
+![NQ=F passport](assets/NQ_F_passport.png)
 
 - Recent completed candles.
 - Position and return estimates.
@@ -284,7 +292,30 @@ For each successful prediction, the app writes a **1920 × 1080 PNG** market pas
 - The discovered equation.
 - The local feature gradient.
 
+Example of CLI output for **NQ=F** as per **25.10.2026, 13:11**:
+
+```text
+[2026-10-25T10:11:16Z INFO  false-promise] Model result: token=NQ=F status=accepted samples=1348 reason=None
+[2026-10-25T10:11:16Z INFO  false-promise] ###########################################################################################
+[2026-10-25T10:11:16Z INFO  false-promise] Equation: (x9 * (x3 * (x4 * x3))) * (x4 * cbrt(x3))
+[2026-10-25T10:11:16Z INFO  false-promise] Prediction for NQ=F: position=-0.9982, scaled_return=-0.2207, raw_return=-0.0002
+[2026-10-25T10:11:16Z INFO  false-promise] ###########################################################################################
+[2026-10-25T10:11:16Z INFO  false-promise] Overfitted: NO
+[2026-10-25T10:11:16Z INFO  false-promise] [INS] Sharpe: 13.9817; annualized: 0.0918
+[2026-10-25T10:11:16Z INFO  false-promise] [OOS] Sharpe: 12.3538; annualized: 0.0811
+[2026-10-25T10:11:16Z INFO  false-promise] ###########################################################################################
+[2026-10-25T10:11:16Z INFO  false-promise] Gradient (∂f/∂x_scaled): [0.0, 0.0, 0.0, 0.221, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0]
+[2026-10-25T10:11:16Z INFO  quafalse-promisent] Leading variable: x9 (82%); determination: mid
+[2026-10-25T10:11:16Z INFO  false-promise] ###########################################################################################
+[2026-10-25T10:11:17Z INFO  false-promise] Passport saved to graphs\NQ_F_passport.png
+[2026-10-25T10:11:17Z INFO  false-promise] Pipeline complete
+```
+
 > **Generated files:** `checkpoints/`, `graphs/`, `outputs/`, and Rust `target/` contents are ignored by Git.
+
+### Model cache
+
+Model checkpoints are stored in `checkpoints/<ticker>.json`. A cached result is reused only when its model version, accepted status, feature bounds, prediction calibration, history timestamps, and target history match the current dataset. If any of those checks fail, Julia runs again and Rust writes a replacement checkpoint.
 
 ## Tests
 
