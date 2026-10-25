@@ -8,7 +8,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=for-the-badge&logo=opensourceinitiative&logoColor=cdd6f4" alt="Apache-2.0 License"></a>
   <img src="https://img.shields.io/badge/Rust-2024-orange?style=for-the-badge&logo=rust&logoColor=white" alt="Rust Version">
   <img src="https://img.shields.io/badge/Julia-Symbolic Regression-9558B2?style=for-the-badge&logo=julia&logoColor=white" alt="Julia Method">
-  <a href="https://github.com/FLMxN/false-promise/stargazers"><img src="https://img.shields.io/github/stars/FLMxN/false-promise?style=for-the-badge&logo=github&logoColor=cdd6f4&label=stars&labelColor=181825&color=f9e2af" alt="GitHub Stars"></a>
+  <a href="https://github.com/FLMxN/kopernik/stargazers"><img src="https://img.shields.io/github/stars/FLMxN/false-promise?style=for-the-badge&logo=github&logoColor=cdd6f4&label=stars&labelColor=181825&color=f9e2af" alt="GitHub Stars"></a>
 </p>
 
 Open-source quantitative finance research tool for NASDAQ via Yahoo Finance data, powered by Rust and Julia.
@@ -301,8 +301,8 @@ Example of CLI output for **NQ=F** as per **25.10.2026, 13:11**:
 [2026-10-25T10:11:16Z INFO  false-promise] Prediction for NQ=F: position=-0.9982, scaled_return=-0.2207, raw_return=-0.0002
 [2026-10-25T10:11:16Z INFO  false-promise] ###########################################################################################
 [2026-10-25T10:11:16Z INFO  false-promise] Overfitted: NO
-[2026-10-25T10:11:16Z INFO  false-promise] [INS] Sharpe: 13.9817; annualized: 0.0918
-[2026-10-25T10:11:16Z INFO  false-promise] [OOS] Sharpe: 12.3538; annualized: 0.0811
+[2026-10-25T10:11:16Z INFO  false-promise] [INS] Sharpe: 13.9817; deannualized: 0.0918
+[2026-10-25T10:11:16Z INFO  false-promise] [OOS] Sharpe: 12.3538; deannualized: 0.0811
 [2026-10-25T10:11:16Z INFO  false-promise] ###########################################################################################
 [2026-10-25T10:11:16Z INFO  false-promise] Gradient (∂f/∂x_scaled): [0.0, 0.0, 0.0, 0.221, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0]
 [2026-10-25T10:11:16Z INFO  false-promise] Leading variable: x9 (82%); determination: mid

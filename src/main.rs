@@ -607,8 +607,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 info!("###########################################################################################");
                 info!("Overfitted: {}", overfitted);
-                info!("[INS] Sharpe: {:#?}; annualized: {:#?}", (ins_sharpe*10000.0).round()/10000.0, (ins_sharpe*10000.0/annualization.sqrt()).round()/10000.0);
-                info!("[OOS] Sharpe: {:#?}; annualized: {:#?}", (oos_sharpe*10000.0).round()/10000.0, (oos_sharpe*10000.0/annualization.sqrt()).round()/10000.0);
+                info!("[INS] Sharpe: {:#?}; deannualized: {:#?}", (ins_sharpe*10000.0).round()/10000.0, (ins_sharpe*10000.0/annualization.sqrt()).round()/10000.0);
+                info!("[OOS] Sharpe: {:#?}; deannualized: {:#?}", (oos_sharpe*10000.0).round()/10000.0, (oos_sharpe*10000.0/annualization.sqrt()).round()/10000.0);
                 info!("###########################################################################################");
 
                 let gradient = match grad(equation, &data.last_features, minima, maxima) {
