@@ -10,9 +10,9 @@
   <img src="https://img.shields.io/badge/Julia-Symbolic Regression-9558B2?style=for-the-badge&logo=julia&logoColor=white" alt="Julia Method">
 </p>
 
-</div>
-
 > "The odds are with us. *Or are they*?" — ***Oracle, Dota 2***
+
+</div>
 
 > [!WARNING]
 > False Promise is experimental research software, not a trading system or financial advice. Market data may be incomplete, and model outputs are unvalidated estimates. Do not make financial decisions based on this program.
@@ -20,22 +20,48 @@
 ## Table of contents
 
 - [Overview](#overview)
+  - [Pipeline at a glance](#pipeline-at-a-glance)
 - [Project layout](#project-layout)
 - [Requirements](#requirements)
+  - [Rust](#rust)
+  - [Julia](#julia)
+  - [Install Julia packages](#install-julia-packages)
+  - [Configure Julia path](#configure-julia-path)
 - [Quick start](#quick-start)
+  - [Run predictions](#run-predictions)
+  - [Logging](#logging)
 - [How it works](#how-it-works)
 - [Market data](#market-data)
+  - [Ticker classification](#ticker-classification)
+  - [Completed candles](#completed-candles)
 - [Features and target](#features-and-target)
+  - [Feature set](#feature-set)
+  - [Prediction target](#prediction-target)
 - [Model and inference](#model-and-inference)
+  - [Training and feature scaling](#training-and-feature-scaling)
+  - [Symbolic-regression search](#symbolic-regression-search)
+  - [Position signal](#position-signal)
+  - [Reported diagnostics](#reported-diagnostics)
 - [Checkpoints and output](#checkpoints-and-output)
+  - [Model cache](#model-cache)
+  - [Market passport](#market-passport)
 - [Tests](#tests)
 - [License](#license)
 
 ## Overview
 
-False Promise fetches completed market candles from Yahoo Finance, builds a volatility-scaled dataset, and uses Julia's symbolic-regression engine to search for a candidate equation. Rust evaluates that equation against the latest completed candle and reports a bounded position signal alongside research diagnostics.
+False Promise is an experimental **market-research pipeline**. It fetches completed candles from Yahoo Finance, prepares a volatility-scaled dataset, and uses Julia's symbolic-regression engine to search for a candidate equation. Rust evaluates that equation against the latest completed candle and reports a bounded position signal with research diagnostics.
 
-The two parts communicate through JSON over standard input and output:
+### Pipeline at a glance
+
+| Stage | Component | Responsibility |
+|---|---|---|
+| **1 · Data** | Yahoo Finance | Supplies quotes and historical candles |
+| **2 · Features** | Rust | Validates candles and builds the training dataset |
+| **3 · Search** | Julia | Searches for a symbolic equation and calculates model metrics |
+| **4 · Inference** | Rust | Evaluates the equation and reports the latest prediction |
+
+Rust and Julia communicate using JSON over standard input and output:
 
 ```text
 Yahoo Finance → Rust data pipeline → Julia symbolic regression
@@ -57,25 +83,39 @@ The Julia entry point is [`src/engine.jl`](src/engine.jl). It uses [`src/mathtoo
 
 ## Requirements
 
-- Rust and Cargo with support for the **2024 edition**.
-- Julia available as `julia` on `PATH`, or its executable configured with `JULIA_PATH`.
-- Julia packages: `JSON3`, `SymbolicRegression`, `LoopVectorization`, and `ConstructionBase`.
-- Internet access to fetch Yahoo Finance quotes and candle history.
+| Requirement | Details |
+|---|---|
+| **Rust** | Rust and Cargo with support for the 2024 edition |
+| **Julia** | `julia` on `PATH`, or the executable configured with `JULIA_PATH` |
+| **Julia packages** | `JSON3`, `SymbolicRegression`, `LoopVectorization`, and `ConstructionBase` |
+| **Network** | Internet access for Yahoo Finance quotes and candle history |
 
-Install the Julia packages in the active Julia environment:
+### Rust
+
+The Rust project uses edition **2024**. Cargo resolves and builds its dependencies on the first run.
+
+### Julia
+
+Julia runs the symbolic-regression engine. Install its packages in the Julia environment that the application will use.
+
+### Install Julia packages
+
+Run this in Julia:
 
 ```julia
 using Pkg
 Pkg.add(["JSON3", "SymbolicRegression", "LoopVectorization", "ConstructionBase"])
 ```
 
-If Julia is not on `PATH`, set `JULIA_PATH` to its executable. For example, in PowerShell:
+### Configure Julia path
+
+If Julia is not on `PATH`, set `JULIA_PATH` to its executable. In PowerShell:
 
 ```powershell
 $env:JULIA_PATH = "C:\path\to\julia.exe"
 ```
 
-On macOS or Linux:
+On macOS or Linux, set the environment variable in your shell:
 
 ```bash
 export JULIA_PATH=/path/to/julia
@@ -83,7 +123,9 @@ export JULIA_PATH=/path/to/julia
 
 ## Quick start
 
-Run one or more Yahoo Finance ticker symbols from the repository root:
+### Run predictions
+
+From the repository root, pass one or more Yahoo Finance ticker symbols:
 
 ```bash
 cargo run -- AAPL
@@ -91,22 +133,31 @@ cargo run -- BTC-USD ETH-USD
 cargo run -- ES=F EURUSD=X ^GSPC
 ```
 
-The first run compiles the Rust application. Pass `--debug` to enable debug-level logs:
+The first run compiles the Rust application. Tickers are processed in the order supplied.
+
+### Logging
+
+Pass `--debug` to enable debug-level application logs:
 
 ```bash
 cargo run -- --debug AAPL
 ```
 
-You can also set the Rust log filter directly:
+Alternatively, set the Rust log filter directly. In PowerShell:
 
 ```powershell
 $env:RUST_LOG = "debug"
 cargo run -- AAPL
 ```
 
-On macOS or Linux, use `RUST_LOG=debug cargo run -- AAPL`.
+On macOS or Linux:
 
-Tickers are processed in order. A ticker is skipped if it has fewer than 50 valid training samples or the latest completed candle does not have a valid feature vector.
+```bash
+RUST_LOG=debug cargo run -- AAPL
+```
+
+> [!NOTE]
+> A ticker is skipped if it has fewer than **50 valid training samples** or the latest completed candle does not have a valid feature vector.
 
 ## How it works
 
@@ -120,7 +171,9 @@ For each ticker, the pipeline:
 
 ## Market data
 
-The asset type is inferred from the ticker symbol. It determines the requested Yahoo Finance history and candle interval:
+### Ticker classification
+
+The asset type is inferred from the ticker symbol. It determines the requested Yahoo Finance history range and candle interval:
 
 | Asset type | Symbol pattern | History requested | Candle interval |
 |---|---|---:|---:|
@@ -130,11 +183,17 @@ The asset type is inferred from the ticker symbol. It determines the requested Y
 | Index | Contains `^` | 2 years | 4 hours |
 | Stock | Any other symbol | 1 year | 1 hour |
 
-Candles are considered complete only after the full interval has elapsed.
+### Completed candles
+
+Only candles whose full interval has elapsed are included. Invalid OHLCV candles break the feature and target sequence; data is not bridged across invalid records.
 
 ## Features and target
 
-For every candle with sufficient history, Rust calculates these 11 features:
+### Feature set
+
+For each candle with sufficient history, Rust calculates **11 features**, grouped below by the kind of market information they describe:
+
+**Price action · Features 1–5**
 
 | # | Feature | Description |
 |---:|---|---|
@@ -143,16 +202,28 @@ For every candle with sufficient history, Rust calculates these 11 features:
 | 3 | High-low range | `(high - low) / close` |
 | 4 | Upper wick | `(high - max(open, close)) / close` |
 | 5 | Lower wick | `(min(open, close) - low) / close` |
+
+**Volume and short-term behavior · Features 6–8**
+
+| # | Feature | Description |
+|---:|---|---|
 | 6 | Relative volume | Volume divided by the mean of up to the preceding 20 candles |
 | 7 | Five-candle mean return | Mean of the latest five close-to-close returns |
 | 8 | Five-candle volatility | Population standard deviation of those five returns |
+
+**Market context · Features 9–11**
+
+| # | Feature | Description |
+|---:|---|---|
 | 9 | Distance from 50-candle mean | `close / mean(close, 50) - 1` |
 | 10 | Distance from 200-candle mean | `close / mean(close, 200) - 1` |
 | 11 | Time of day | UTC hour encoded as `sin(2π × hour / 24)` |
 
-Invalid candles break the feature and target sequence rather than being silently bridged. Rows with invalid prices, volume, or derived values are discarded.
+Rows with invalid prices, volume, or derived values are discarded.
 
-For a feature row at candle *t*, the target is the next candle's close-to-close return divided by the five-candle volatility measured at *t*:
+### Prediction target
+
+For a feature row at candle *t*, the target is the **next candle's close-to-close return**, scaled by the five-candle volatility measured at *t*:
 
 ```text
 target_return(t+1)        = (close(t+1) - close(t)) / close(t)
@@ -161,25 +232,59 @@ target_scaled_return(t+1) = target_return(t+1) / volatility(t)
 
 ## Model and inference
 
-Julia uses the first 80% of the samples for symbolic-regression search and reserves the remainder for out-of-sample evaluation. Feature values are scaled to `[-1, 1]` using the 1st and 99th percentile training bounds.
+### Training and feature scaling
 
-The search configuration is defined in [`src/mathtools.jl`](src/mathtools.jl): a budget of 800 iterations, multithreading, maximum expression size 12, maximum depth 5, binary `+`, `-`, and `*`, and unary `sqrt`, `cbrt`, and `tanh`.
+Julia uses the first **80%** of samples for symbolic-regression search and reserves the remainder for out-of-sample evaluation. Each feature is scaled to `[-1, 1]` using its **1st and 99th percentile** training bounds.
 
-The position signal is bounded with a hyperbolic tangent using the median and scaled median absolute deviation of in-sample predictions:
+### Symbolic-regression search
+
+The search configuration is defined in [`src/mathtools.jl`](src/mathtools.jl):
+
+| Setting | Value |
+|---|---|
+| Iteration budget | 800 |
+| Parallelism | Multithreading |
+| Maximum expression size | 12 |
+| Maximum expression depth | 5 |
+| Binary operators | `+`, `-`, `*` |
+| Unary operators | `sqrt`, `cbrt`, `tanh` |
+
+### Position signal
+
+The model centers and scales predictions using their in-sample median and scaled median absolute deviation. A **hyperbolic tangent** maps the resulting value to a bounded position signal:
 
 ```text
 position = tanh((prediction - prediction_median) / prediction_scale)
 ```
 
-The console report includes the discovered equation, scaled prediction, estimated raw return, in-sample and out-of-sample Sharpe metrics, and a local gradient with respect to the scaled features. The metrics and gradient are exploratory diagnostics, not validated forecasts or recommendations.
+### Reported diagnostics
+
+The console report includes:
+
+- **Equation** — the expression selected by symbolic regression.
+- **Prediction** — the scaled model output and estimated raw return.
+- **Sharpe metrics** — in-sample and out-of-sample results.
+- **Local gradient** — the equation's local sensitivity to each scaled feature.
+
+These are exploratory diagnostics, not validated forecasts or recommendations.
 
 ## Checkpoints and output
 
-Model checkpoints are stored in `checkpoints/<ticker>.json`. A cached result is reused only when its model version, accepted status, feature bounds, prediction calibration, history timestamps, and target history match the current dataset. Otherwise, the Julia model runs again and Rust writes a replacement checkpoint.
+### Model cache
 
-For each successful prediction, the app writes a **1920 × 1080** PNG market passport to `graphs/<ticker>_passport.png`. The passport summarizes recent candles, the position and return estimates, in-sample and out-of-sample Sharpe metrics, the discovered equation, and the local feature gradient.
+Model checkpoints are stored in `checkpoints/<ticker>.json`. A cached result is reused only when its model version, accepted status, feature bounds, prediction calibration, history timestamps, and target history match the current dataset. If any of those checks fail, Julia runs again and Rust writes a replacement checkpoint.
 
-Generated `checkpoints/`, `graphs/`, `outputs/`, and Rust `target/` contents are ignored by Git.
+### Market passport
+
+For each successful prediction, the app writes a **1920 × 1080 PNG** market passport to `graphs/<ticker>_passport.png`. It contains:
+
+- Recent completed candles.
+- Position and return estimates.
+- In-sample and out-of-sample Sharpe metrics.
+- The discovered equation.
+- The local feature gradient.
+
+> **Generated files:** `checkpoints/`, `graphs/`, `outputs/`, and Rust `target/` contents are ignored by Git.
 
 ## Tests
 
