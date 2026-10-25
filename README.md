@@ -305,7 +305,7 @@ Example of CLI output for **NQ=F** as per **25.10.2026, 13:11**:
 [2026-10-25T10:11:16Z INFO  false-promise] [OOS] Sharpe: 12.3538; annualized: 0.0811
 [2026-10-25T10:11:16Z INFO  false-promise] ###########################################################################################
 [2026-10-25T10:11:16Z INFO  false-promise] Gradient (∂f/∂x_scaled): [0.0, 0.0, 0.0, 0.221, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0]
-[2026-10-25T10:11:16Z INFO  quafalse-promisent] Leading variable: x9 (82%); determination: mid
+[2026-10-25T10:11:16Z INFO  false-promise] Leading variable: x9 (82%); determination: mid
 [2026-10-25T10:11:16Z INFO  false-promise] ###########################################################################################
 [2026-10-25T10:11:17Z INFO  false-promise] Passport saved to graphs\NQ_F_passport.png
 [2026-10-25T10:11:17Z INFO  false-promise] Pipeline complete
